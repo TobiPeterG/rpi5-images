@@ -1,0 +1,16 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+# Keep producing a desync index for the independently published EROFS root
+# partition.
+shopt -s nullglob
+roots=("$OUTPUTDIR"/"$IMAGE_ID"*root-arm64.raw "$OUTPUTDIR"/"$IMAGE_ID"*.root.raw)
+
+if (( ${#roots[@]} != 1 )); then
+    printf 'Expected one split EROFS root artifact for %s, found %d\n' \
+        "$IMAGE_ID" "${#roots[@]}" >&2
+    printf 'Candidates: %s\n' "${roots[*]:-<none>}" >&2
+    exit 1
+fi
+
+desync make --chunk-size 1024:2048:4096 "${roots[0]}.caibx" "${roots[0]}"

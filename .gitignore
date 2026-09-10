@@ -1,0 +1,7 @@
+/mkosi.output/
+/mkosi.tools/
+/mkosi.tools.manifest
+/mkosi.cache/
+/mkosi.pkgcache/
+/zypper/
+/.mkosi-private/

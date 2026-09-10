@@ -1,0 +1,201 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+[[ ${ARCHITECTURE:?} == arm64 ]] || {
+    echo "This image is only supported for arm64" >&2
+    exit 1
+}
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+
+# The verified root is overlaid with tmpfs at boot.
+: > /etc/fstab
+: > /etc/machine-id
+install -d -m 0755 /etc/systemd/journald.conf.d /efi/loader /home /var/log
+cat > /etc/systemd/journald.conf.d/10-persistent-log.conf <<'EOF'
+[Journal]
+Storage=persistent
+EOF
+cat > /efi/loader/loader.conf <<'EOF'
+timeout 0
+editor no
+auto-entries no
+auto-firmware no
+EOF
+
+systemctl enable NetworkManager.service
+systemctl enable sshd.service
+systemctl enable serial-getty@ttyAMA10.service
+systemctl enable systemd-repart.service
+
+work=/run/rpi5-microos-boot
+boot_tree=${work}/boot-tree
+key_dir=${work}/uefi-keys
+owner_dtb=${work}/owner-rpi5.dtb
+mkdir -p "${boot_tree}" "${key_dir}"
+chmod 0700 "${key_dir}"
+trap 'rm -rf -- "${work}"' EXIT
+
+test_cert=${CHROOT_SRCDIR:?}/.mkosi-private/test-secure-boot.crt
+[[ -s ${test_cert} ]] || {
+    echo "Temporary Secure Boot certificate not found: ${test_cert}" >&2
+    exit 1
+}
+
+guid=a5c059a1-94e4-4aa7-87b5-ab155c2bf072
+cert_to_esl() {
+    local cert=$1 output=$2 pem=${key_dir}/certificate.pem
+    if openssl x509 -in "${cert}" -noout >/dev/null 2>&1; then
+        cp -- "${cert}" "${pem}"
+    else
+        openssl x509 -inform DER -in "${cert}" -out "${pem}"
+    fi
+    cert-to-efi-sig-list -g "${guid}" "${pem}" "${output}"
+}
+
+# One short-lived key owns PK/KEK and signs this test build. The db also gains
+# the public certificates under mkosi.keys/uefi-db, including the openSUSE
+# Secure Boot CA
+cert_to_esl "${test_cert}" "${key_dir}/test.esl"
+cp "${key_dir}/test.esl" "${key_dir}/PK.esl"
+cp "${key_dir}/test.esl" "${key_dir}/KEK.esl"
+cp "${key_dir}/test.esl" "${key_dir}/db.esl"
+
+shopt -s nullglob
+systemd_boot=/efi/EFI/BOOT/BOOTAA64.EFI
+[[ -s ${systemd_boot} ]] || {
+    echo "systemd-boot fallback binary not found: ${systemd_boot}" >&2
+    exit 1
+}
+
+extra_certs=("${CHROOT_SRCDIR}"/mkosi.keys/uefi-db/*.crt)
+index=0
+for cert in "${extra_certs[@]}"; do
+    cert_to_esl "${cert}" "${key_dir}/db-${index}.esl"
+    command cat "${key_dir}/db-${index}.esl" >> "${key_dir}/db.esl"
+    ((index += 1))
+done
+
+timestamp=$(date -u -d "@${SOURCE_DATE_EPOCH:-0}" '+%Y-%m-%d %H:%M:%S')
+for variable in PK KEK db; do
+    sign-efi-sig-list -o -g "${guid}" -t "${timestamp}" \
+        "${variable}" "${key_dir}/${variable}.esl" "${key_dir}/${variable}.auth"
+done
+
+# A project may supply a real, maintained dbx as ESL data. An empty dbx has no
+# security value, so this first-test image deliberately omits it by default.
+dbx_lists=("${CHROOT_SRCDIR}"/mkosi.keys/uefi-dbx/*.esl)
+if (( ${#dbx_lists[@]} > 0 )); then
+    command cat "${dbx_lists[@]}" > "${key_dir}/dbx.esl"
+    sign-efi-sig-list -o -g "${guid}" -t "${timestamp}" \
+        dbx "${key_dir}/dbx.esl" "${key_dir}/dbx.auth"
+fi
+
+firmware_tree=
+for candidate in /boot/vc /usr/share/raspberrypi-firmware; do
+    if [[ -f ${candidate}/bcm2712-rpi-5-b.dtb ]]; then
+        firmware_tree=${candidate}
+        break
+    fi
+done
+[[ -n ${firmware_tree} ]] || {
+    echo "Raspberry Pi 5 firmware DTB was not installed" >&2
+    exit 1
+}
+cp -a "${firmware_tree}/." "${boot_tree}/"
+
+uboot=
+for candidate in \
+    /boot/vc/u-boot.bin \
+    /usr/lib/u-boot/rpi_arm64/u-boot.bin \
+    /usr/lib/u-boot/rpi_arm64/u-boot-dtb.bin; do
+    if [[ -s ${candidate} ]]; then
+        uboot=${candidate}
+        break
+    fi
+done
+[[ -n ${uboot} ]] || {
+    echo "u-boot-rpiarm64 did not provide a usable U-Boot binary" >&2
+    exit 1
+}
+install -m 0644 "${uboot}" "${boot_tree}/u-boot.bin"
+
+cat > "${work}/secure-boot.dtso" <<EOF
+/dts-v1/;
+/plugin/;
+
+&{/} {
+    uefi-secure-boot {
+        pk = /incbin/("${key_dir}/PK.auth");
+        kek = /incbin/("${key_dir}/KEK.auth");
+        db = /incbin/("${key_dir}/db.auth");
+EOF
+if [[ -s ${key_dir}/dbx.auth ]]; then
+    printf '        dbx = /incbin/("%s");\n' "${key_dir}/dbx.auth" >> "${work}/secure-boot.dtso"
+fi
+cat >> "${work}/secure-boot.dtso" <<'EOF'
+    };
+};
+EOF
+
+dtc -@ -I dts -O dtb -o "${work}/secure-boot.dtbo" "${work}/secure-boot.dtso"
+fdtoverlay -i "${firmware_tree}/bcm2712-rpi-5-b.dtb" \
+    -o "${owner_dtb}" "${work}/secure-boot.dtbo"
+
+bootcmd='fdt addr ${fdtcontroladdr}; if env print -e -n PK; then echo UEFI Secure Boot keys already enrolled; else '
+for variable in db dbx kek pk; do
+    property=${variable}
+    efi_variable=${variable}
+    [[ ${variable} != kek ]] || efi_variable=KEK
+    [[ ${variable} != pk ]] || efi_variable=PK
+    if [[ ${variable} == dbx && ! -s ${key_dir}/dbx.auth ]]; then
+        continue
+    fi
+    bootcmd+="if fdt get addr sb_addr /uefi-secure-boot ${property} && fdt get size sb_size /uefi-secure-boot ${property} && env set -e -nv -bs -rt -at -i \${sb_addr}:\${sb_size} ${efi_variable}; then true; else echo ERROR: failed to enroll ${efi_variable}; reset; fi; "
+done
+bootcmd+='fi; env print -e SecureBoot; if load mmc 0:1 ${kernel_addr_r} /EFI/BOOT/BOOTAA64.EFI; then bootefi ${kernel_addr_r} ${fdtcontroladdr}; fi; echo ERROR: verified systemd-boot failed; reset'
+
+fdtput -p -t s "${owner_dtb}" /config bootcmd "${bootcmd}"
+fdtput -p -t i "${owner_dtb}" /config bootdelay -2
+install -m 0644 "${owner_dtb}" "${boot_tree}/owner-rpi5.dtb"
+
+sed -i '/^[[:space:]]*boot_ramdisk[[:space:]]*=/d' "${boot_tree}/config.txt"
+cat >> "${boot_tree}/config.txt" <<'EOF'
+
+# Raspberry Pi 5 verified UEFI boot
+[pi5]
+kernel=u-boot.bin
+device_tree=owner-rpi5.dtb
+enable_uart=1
+uart_2ndstage=1
+
+[all]
+EOF
+
+bytes=$(du -sb "${boot_tree}" | awk '{print $1}')
+mebibytes=$(( (bytes + 16 * 1024 * 1024 + 1024 * 1024 - 1) / (1024 * 1024) ))
+(( mebibytes >= 64 )) || mebibytes=64
+(( mebibytes <= 180 )) || {
+    echo "boot.img would exceed the Raspberry Pi 180 MiB limit (${mebibytes} MiB)" >&2
+    exit 1
+}
+
+boot_img=${work}/boot.img
+truncate -s "${mebibytes}M" "${boot_img}"
+mkfs.fat -F 32 -n RPIBOOT "${boot_img}"
+for entry in "${boot_tree}"/*; do
+    mcopy -i "${boot_img}" -s "${entry}" ::/
+done
+fsck.fat -vn "${boot_img}"
+
+install -m 0644 "${boot_img}" /efi/boot.img
+printf 'boot_ramdisk=1\n' > /efi/config.txt
+
+# Signing boot.img is necessarily device-owner specific. Do it automatically
+# when the owner key and Raspberry Pi signing utility are supplied.
+rpi_key=${CHROOT_SRCDIR}/mkosi.keys/rpi-boot/private.pem
+if [[ -s ${rpi_key} ]] && command -v rpi-eeprom-digest >/dev/null; then
+    rpi-eeprom-digest -i /efi/boot.img -o /efi/boot.sig -k "${rpi_key}"
+fi
+
+sync
