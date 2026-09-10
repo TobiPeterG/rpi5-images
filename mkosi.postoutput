@@ -14,3 +14,29 @@ if (( ${#roots[@]} != 1 )); then
 fi
 
 desync make --chunk-size 1024:2048:4096 "${roots[0]}.caibx" "${roots[0]}"
+
+# The mkosi checksum file is generated before post-output scripts run, so
+# create a checksum for the additional delta file here.
+(
+    cd "$OUTPUTDIR"
+    sha256sum "$(basename "${roots[0]}.caibx")" > "$(basename "${roots[0]}.caibx").sha256"
+)
+
+
+# Keep producing an XZ-compressed version of the complete disk image.
+disk="$OUTPUTDIR/${IMAGE_ID}-${IMAGE_VERSION}.${ARCHITECTURE}.raw"
+
+if [ ! -f "$disk" ]; then
+    printf 'Expected complete raw disk image not found: %s\n' "$disk" >&2
+    exit 1
+fi
+
+xz --threads=0 --keep --force "$disk"
+
+
+# The mkosi checksum file is generated before post-output scripts run, so
+# create a checksum for the additional compressed disk image here.
+(
+    cd "$OUTPUTDIR"
+    sha256sum "$(basename "${disk}.xz")" > "$(basename "${disk}.xz").sha256"
+)
