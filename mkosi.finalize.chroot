@@ -24,4 +24,3 @@ EOF
 systemctl enable NetworkManager.service
 systemctl enable sshd.service
 systemctl enable serial-getty@ttyAMA10.service
-systemctl enable systemd-repart.service

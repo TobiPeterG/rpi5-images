@@ -6,7 +6,6 @@ set -euo pipefail
     exit 1
 }
 
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 root=${BUILDROOT:?}
 
 work=/run/rpi5-microos-boot
