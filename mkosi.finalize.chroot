@@ -24,3 +24,29 @@ EOF
 systemctl enable NetworkManager.service
 systemctl enable sshd.service
 systemctl enable serial-getty@ttyAMA10.service
+
+# mkosi discovers kernels below /usr/lib/modules, while openSUSE installs the
+# arm64 boot image below /boot and leaves only vmlinux.xz in the module tree.
+# Expose the bootable image where mkosi expects it so it does not mistake the
+# ELF vmlinux archive for a PE-signable kernel image.
+shopt -s nullglob
+for modules_dir in /usr/lib/modules/*; do
+    [[ -d ${modules_dir} ]] || continue
+    [[ -e ${modules_dir}/vmlinuz ]] && continue
+
+    kernel_version=${modules_dir##*/}
+    kernel_image=
+    for candidate in "/boot/vmlinuz-${kernel_version}" "/boot/Image-${kernel_version}"; do
+        if [[ -f ${candidate} ]]; then
+            kernel_image=${candidate}
+            break
+        fi
+    done
+
+    [[ -n ${kernel_image} ]] || {
+        echo "Bootable kernel image not found for ${kernel_version}" >&2
+        exit 1
+    }
+
+    cp --reflink=auto --preserve=mode,timestamps "${kernel_image}" "${modules_dir}/vmlinuz"
+done
