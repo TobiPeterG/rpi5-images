@@ -1,0 +1,27 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+[[ ${ARCHITECTURE:?} == arm64 ]] || {
+    echo "This image is only supported for arm64" >&2
+    exit 1
+}
+
+# The verified root is overlaid with tmpfs at boot.
+: > /etc/fstab
+: > /etc/machine-id
+install -d -m 0755 /etc/systemd/journald.conf.d /efi/loader /home /var/log
+cat > /etc/systemd/journald.conf.d/10-persistent-log.conf <<'EOF'
+[Journal]
+Storage=persistent
+EOF
+cat > /efi/loader/loader.conf <<'EOF'
+timeout 0
+editor no
+auto-entries no
+auto-firmware no
+EOF
+
+systemctl enable NetworkManager.service
+systemctl enable sshd.service
+systemctl enable serial-getty@ttyAMA10.service
+systemctl enable systemd-repart.service

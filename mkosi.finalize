@@ -7,26 +7,7 @@ set -euo pipefail
 }
 
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
-
-# The verified root is overlaid with tmpfs at boot.
-: > /etc/fstab
-: > /etc/machine-id
-install -d -m 0755 /etc/systemd/journald.conf.d /efi/loader /home /var/log
-cat > /etc/systemd/journald.conf.d/10-persistent-log.conf <<'EOF'
-[Journal]
-Storage=persistent
-EOF
-cat > /efi/loader/loader.conf <<'EOF'
-timeout 0
-editor no
-auto-entries no
-auto-firmware no
-EOF
-
-systemctl enable NetworkManager.service
-systemctl enable sshd.service
-systemctl enable serial-getty@ttyAMA10.service
-systemctl enable systemd-repart.service
+root=${BUILDROOT:?}
 
 work=/run/rpi5-microos-boot
 boot_tree=${work}/boot-tree
@@ -62,7 +43,7 @@ cp "${key_dir}/test.esl" "${key_dir}/KEK.esl"
 cp "${key_dir}/test.esl" "${key_dir}/db.esl"
 
 shopt -s nullglob
-systemd_boot=/efi/EFI/BOOT/BOOTAA64.EFI
+systemd_boot=${root}/efi/EFI/BOOT/BOOTAA64.EFI
 [[ -s ${systemd_boot} ]] || {
     echo "systemd-boot fallback binary not found: ${systemd_boot}" >&2
     exit 1
@@ -92,7 +73,7 @@ if (( ${#dbx_lists[@]} > 0 )); then
 fi
 
 firmware_tree=
-for candidate in /boot/vc /usr/share/raspberrypi-firmware; do
+for candidate in "${root}/boot/vc" "${root}/usr/share/raspberrypi-firmware"; do
     if [[ -f ${candidate}/bcm2712-rpi-5-b.dtb ]]; then
         firmware_tree=${candidate}
         break
@@ -106,9 +87,9 @@ cp -a "${firmware_tree}/." "${boot_tree}/"
 
 uboot=
 for candidate in \
-    /boot/vc/u-boot.bin \
-    /usr/lib/u-boot/rpi_arm64/u-boot.bin \
-    /usr/lib/u-boot/rpi_arm64/u-boot-dtb.bin; do
+    "${root}/boot/vc/u-boot.bin" \
+    "${root}/usr/lib/u-boot/rpi_arm64/u-boot.bin" \
+    "${root}/usr/lib/u-boot/rpi_arm64/u-boot-dtb.bin"; do
     if [[ -s ${candidate} ]]; then
         uboot=${candidate}
         break
@@ -188,14 +169,17 @@ for entry in "${boot_tree}"/*; do
 done
 fsck.fat -vn "${boot_img}"
 
-install -m 0644 "${boot_img}" /efi/boot.img
-printf 'boot_ramdisk=1\n' > /efi/config.txt
+install -m 0644 "${boot_img}" "${root}/efi/boot.img"
+printf 'boot_ramdisk=1\n' > "${root}/efi/config.txt"
 
 # Signing boot.img is necessarily device-owner specific. Do it automatically
 # when the owner key and Raspberry Pi signing utility are supplied.
 rpi_key=${CHROOT_SRCDIR}/mkosi.keys/rpi-boot/private.pem
 if [[ -s ${rpi_key} ]] && command -v rpi-eeprom-digest >/dev/null; then
-    rpi-eeprom-digest -i /efi/boot.img -o /efi/boot.sig -k "${rpi_key}"
+    rpi-eeprom-digest \
+        -i "${root}/efi/boot.img" \
+        -o "${root}/efi/boot.sig" \
+        -k "${rpi_key}"
 fi
 
 sync
