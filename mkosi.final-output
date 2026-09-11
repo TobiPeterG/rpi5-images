@@ -1,0 +1,17 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+# This is run by the second mkosi-obs stage, after OBS signatures have been
+# attached and the final disk image has been reconstructed.
+disk="${OUTPUTDIR}/${IMAGE_ID}_${IMAGE_VERSION}_${ARCHITECTURE}.raw"
+[[ -f ${disk} ]] || {
+    echo "Final signed raw disk image not found: ${disk}" >&2
+    exit 1
+}
+
+xz --threads=0 --keep --force "${disk}"
+
+(
+    cd "${OUTPUTDIR}"
+    sha256sum "$(basename "${disk}.xz")" > "$(basename "${disk}.xz").sha256"
+)

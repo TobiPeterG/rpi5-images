@@ -4,12 +4,20 @@ set -euo pipefail
 # Keep producing a desync index for the independently published EROFS root
 # partition.
 shopt -s nullglob
-roots=("$OUTPUTDIR"/"$IMAGE_ID"*root-arm64.raw "$OUTPUTDIR"/"$IMAGE_ID"*.root.raw)
+roots=("$OUTPUTDIR"/"$IMAGE_ID"_"$IMAGE_VERSION"_"$ARCHITECTURE".root-"$ARCHITECTURE"-[[:xdigit:]]*.raw)
+verities=("$OUTPUTDIR"/"$IMAGE_ID"_"$IMAGE_VERSION"_"$ARCHITECTURE".root-"$ARCHITECTURE"-verity-*.raw)
 
 if (( ${#roots[@]} != 1 )); then
     printf 'Expected one split EROFS root artifact for %s, found %d\n' \
         "$IMAGE_ID" "${#roots[@]}" >&2
     printf 'Candidates: %s\n' "${roots[*]:-<none>}" >&2
+    exit 1
+fi
+
+if (( ${#verities[@]} != 1 )); then
+    printf 'Expected one split root verity artifact for %s, found %d\n' \
+        "$IMAGE_ID" "${#verities[@]}" >&2
+    printf 'Candidates: %s\n' "${verities[*]:-<none>}" >&2
     exit 1
 fi
 
@@ -22,21 +30,48 @@ desync make --chunk-size 1024:2048:4096 "${roots[0]}.caibx" "${roots[0]}"
     sha256sum "$(basename "${roots[0]}.caibx")" > "$(basename "${roots[0]}.caibx").sha256"
 )
 
+# support download compressed copies of the fixed-size slots.
+for artifact in "${roots[0]}" "${verities[0]}"; do
+    xz --threads=0 --keep --force "${artifact}"
+    (
+        cd "$OUTPUTDIR"
+        sha256sum "$(basename "${artifact}.xz")" > "$(basename "${artifact}.xz").sha256"
+    )
+done
 
-# Keep producing an XZ-compressed version of the complete disk image.
-disk="$OUTPUTDIR/${IMAGE_ID}-${IMAGE_VERSION}.${ARCHITECTURE}.raw"
+
+# In OBS, mkosi-obs creates a second-stage mkosi.conf that attaches the OBS
+# signatures to the UKI, bootloader and verity metadata. Compressing the disk
+# here would preserve the pre-signing disk and publish it alongside the final
+# raw image. Add a post-output helper to that generated recipe instead, so the
+# flashable XZ image is made only after all signatures have been attached.
+disk="$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}_${ARCHITECTURE}.raw"
 
 if [ ! -f "$disk" ]; then
     printf 'Expected complete raw disk image not found: %s\n' "$disk" >&2
     exit 1
 fi
 
-xz --threads=0 --keep --force "$disk"
+if [[ -e /.build.binaries ]]; then
+    recipe=${OUTPUTDIR}/mkosi.conf
+    [[ -f ${recipe} ]] || {
+        echo "mkosi-obs did not create its second-stage recipe before mkosi.postoutput" >&2
+        exit 1
+    }
 
+    install -m 0755 "${SRCDIR}/mkosi.final-output" "${OUTPUTDIR}/mkosi.final-output"
+    cat >> "${recipe}" <<'EOF'
 
-# The mkosi checksum file is generated before post-output scripts run, so
-# create a checksum for the additional compressed disk image here.
-(
-    cd "$OUTPUTDIR"
-    sha256sum "$(basename "${disk}.xz")" > "$(basename "${disk}.xz").sha256"
-)
+[Content]
+PostOutputScripts=%D/mkosi.final-output
+EOF
+else
+    xz --threads=0 --keep --force "$disk"
+
+    # The mkosi checksum file is generated before post-output scripts run, so
+    # create a checksum for the additional compressed disk image here.
+    (
+        cd "$OUTPUTDIR"
+        sha256sum "$(basename "${disk}.xz")" > "$(basename "${disk}.xz").sha256"
+    )
+fi
