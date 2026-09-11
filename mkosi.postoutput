@@ -52,7 +52,9 @@ if [ ! -f "$disk" ]; then
     exit 1
 fi
 
-if [[ -e /.build.binaries ]]; then
+# mkosi post-output scripts run in a sandbox where /.build.binaries is not
+# visible. mkosi-obs exposes the OBS SOURCES directory
+if [[ -s /usr/src/packages/SOURCES/_projectcert.crt ]]; then
     recipe=${OUTPUTDIR}/mkosi.conf
     [[ -f ${recipe} ]] || {
         echo "mkosi-obs did not create its second-stage recipe before mkosi.postoutput" >&2
