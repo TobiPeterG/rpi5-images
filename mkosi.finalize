@@ -57,7 +57,11 @@ for cert in "${extra_certs[@]}"; do
     ((index += 1))
 done
 
-timestamp=$(date -u -d "@${SOURCE_DATE_EPOCH:-0}" '+%Y-%m-%d %H:%M:%S')
+timestamp_epoch=${SOURCE_DATE_EPOCH:-}
+if [[ ! ${timestamp_epoch} =~ ^[0-9]+$ ]] || (( timestamp_epoch == 0 )); then
+    timestamp_epoch=$(date -u '+%s')
+fi
+timestamp=$(date -u -d "@${timestamp_epoch}" '+%Y-%m-%d %H:%M:%S')
 # uses the same temporary key for all three roles. PK is
 # self-signed, while that same key acts as PK when authorizing KEK and as KEK
 # when authorizing db.
