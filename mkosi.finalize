@@ -162,7 +162,7 @@ mebibytes=$(( (bytes + 16 * 1024 * 1024 + 1024 * 1024 - 1) / (1024 * 1024) ))
 
 boot_img=${work}/boot.img
 truncate -s "${mebibytes}M" "${boot_img}"
-mkfs.fat -F 32 -n RPIBOOT "${boot_img}"
+mkfs.fat -S 512 -F 32 -n RPIBOOT "${boot_img}"
 for entry in "${boot_tree}"/*; do
     mcopy -i "${boot_img}" -s "${entry}" ::/
 done
