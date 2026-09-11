@@ -16,12 +16,34 @@ mkdir -p "${boot_tree}" "${key_dir}"
 chmod 0700 "${key_dir}"
 trap 'rm -rf -- "${work}"' EXIT
 
-test_cert=${CHROOT_SRCDIR:?}/.mkosi-private/test-secure-boot.crt
-test_key=${CHROOT_SRCDIR}/.mkosi-private/test-secure-boot.key
-[[ -s ${test_cert} && -s ${test_key} ]] || {
-    echo "Temporary Secure Boot key pair not found: ${test_cert}, ${test_key}" >&2
+source_parent=${CHROOT_SRCDIR:?}
+source_parent=${source_parent%/*}
+project_cert=${source_parent}/_projectcert.crt
+if [[ ! -s ${project_cert} ]]; then
+    project_cert=${CHROOT_SRCDIR}/mkosi.keys/obs-project.crt
+fi
+[[ -s ${project_cert} ]] || {
+    echo "OBS project certificate not found" >&2
     exit 1
 }
+
+# systemd-sysupdate verifies the repository's SHA256SUMS.gpg with this
+# keyring.
+install -d -m 0755 "${root}/usr/lib/systemd"
+base64 -d "${CHROOT_SRCDIR}/mkosi.keys/obs-project.pgp.b64" \
+    > "${root}/usr/lib/systemd/import-pubring.pgp"
+chmod 0644 "${root}/usr/lib/systemd/import-pubring.pgp"
+
+# U-Boot insists on a syntactically complete EFI authenticated-variable
+# envelope even in Setup Mode, although it skips verifying its
+# PKCS#7 signature until SecureBoot becomes active. This throwaway key only
+# creates those envelopes.
+envelope_key=${key_dir}/envelope.key
+envelope_cert=${key_dir}/envelope.crt
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+    -subj /CN=U-Boot-setup-envelope/ \
+    -keyout "${envelope_key}" -out "${envelope_cert}" \
+    >/dev/null 2>&1
 
 guid=a5c059a1-94e4-4aa7-87b5-ab155c2bf072
 cert_to_esl() {
@@ -34,13 +56,13 @@ cert_to_esl() {
     cert-to-efi-sig-list -g "${guid}" "${pem}" "${output}"
 }
 
-# One short-lived key owns PK/KEK and signs this test build. The db also gains
+# The OBS project certificate owns PK/KEK and is trusted by db. db also gains
 # the public certificates under mkosi.keys/uefi-db, including the openSUSE
-# Secure Boot CA
-cert_to_esl "${test_cert}" "${key_dir}/test.esl"
-cp "${key_dir}/test.esl" "${key_dir}/PK.esl"
-cp "${key_dir}/test.esl" "${key_dir}/KEK.esl"
-cp "${key_dir}/test.esl" "${key_dir}/db.esl"
+# Secure Boot CA.
+cert_to_esl "${project_cert}" "${key_dir}/project.esl"
+cp "${key_dir}/project.esl" "${key_dir}/PK.esl"
+cp "${key_dir}/project.esl" "${key_dir}/KEK.esl"
+cp "${key_dir}/project.esl" "${key_dir}/db.esl"
 
 shopt -s nullglob
 systemd_boot=${root}/efi/EFI/BOOT/BOOTAA64.EFI
@@ -62,11 +84,11 @@ if [[ ! ${timestamp_epoch} =~ ^[0-9]+$ ]] || (( timestamp_epoch == 0 )); then
     timestamp_epoch=$(date -u '+%s')
 fi
 timestamp=$(date -u -d "@${timestamp_epoch}" '+%Y-%m-%d %H:%M:%S')
-# uses the same temporary key for all three roles. PK is
-# self-signed, while that same key acts as PK when authorizing KEK and as KEK
-# when authorizing db.
+# U-Boot accepts these envelopes only while SecureBoot=0. bootcmd installs db
+# and KEK first and PK last, at which point Secure Boot becomes active. The
+# verified control DTB authenticates all three payloads.
 for variable in PK KEK db; do
-    sign-efi-sig-list -c "${test_cert}" -k "${test_key}" \
+    sign-efi-sig-list -c "${envelope_cert}" -k "${envelope_key}" \
         -g "${guid}" -t "${timestamp}" \
         "${variable}" "${key_dir}/${variable}.esl" "${key_dir}/${variable}.auth"
 done
@@ -74,7 +96,7 @@ done
 dbx_lists=("${CHROOT_SRCDIR}"/mkosi.keys/uefi-dbx/*.esl)
 if (( ${#dbx_lists[@]} > 0 )); then
     command cat "${dbx_lists[@]}" > "${key_dir}/dbx.esl"
-    sign-efi-sig-list -c "${test_cert}" -k "${test_key}" \
+    sign-efi-sig-list -c "${envelope_cert}" -k "${envelope_key}" \
         -g "${guid}" -t "${timestamp}" \
         dbx "${key_dir}/dbx.esl" "${key_dir}/dbx.auth"
 fi
@@ -131,7 +153,7 @@ fdtoverlay -i "${firmware_tree}/bcm2712-rpi-5-b.dtb" \
     -o "${owner_dtb}" "${work}/secure-boot.dtbo"
 
 bootcmd='fdt addr ${fdtcontroladdr}; if env print -e -n PK; then echo UEFI Secure Boot keys already enrolled; else '
-for variable in pk kek db dbx; do
+for variable in db dbx kek pk; do
     property=${variable}
     efi_variable=${variable}
     [[ ${variable} != kek ]] || efi_variable=KEK
