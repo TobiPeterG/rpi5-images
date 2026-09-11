@@ -17,8 +17,9 @@ chmod 0700 "${key_dir}"
 trap 'rm -rf -- "${work}"' EXIT
 
 test_cert=${CHROOT_SRCDIR:?}/.mkosi-private/test-secure-boot.crt
-[[ -s ${test_cert} ]] || {
-    echo "Temporary Secure Boot certificate not found: ${test_cert}" >&2
+test_key=${CHROOT_SRCDIR}/.mkosi-private/test-secure-boot.key
+[[ -s ${test_cert} && -s ${test_key} ]] || {
+    echo "Temporary Secure Boot key pair not found: ${test_cert}, ${test_key}" >&2
     exit 1
 }
 
@@ -57,17 +58,20 @@ for cert in "${extra_certs[@]}"; do
 done
 
 timestamp=$(date -u -d "@${SOURCE_DATE_EPOCH:-0}" '+%Y-%m-%d %H:%M:%S')
+# uses the same temporary key for all three roles. PK is
+# self-signed, while that same key acts as PK when authorizing KEK and as KEK
+# when authorizing db.
 for variable in PK KEK db; do
-    sign-efi-sig-list -o -g "${guid}" -t "${timestamp}" \
+    sign-efi-sig-list -c "${test_cert}" -k "${test_key}" \
+        -g "${guid}" -t "${timestamp}" \
         "${variable}" "${key_dir}/${variable}.esl" "${key_dir}/${variable}.auth"
 done
 
-# A project may supply a real, maintained dbx as ESL data. An empty dbx has no
-# security value, so this first-test image deliberately omits it by default.
 dbx_lists=("${CHROOT_SRCDIR}"/mkosi.keys/uefi-dbx/*.esl)
 if (( ${#dbx_lists[@]} > 0 )); then
     command cat "${dbx_lists[@]}" > "${key_dir}/dbx.esl"
-    sign-efi-sig-list -o -g "${guid}" -t "${timestamp}" \
+    sign-efi-sig-list -c "${test_cert}" -k "${test_key}" \
+        -g "${guid}" -t "${timestamp}" \
         dbx "${key_dir}/dbx.esl" "${key_dir}/dbx.auth"
 fi
 
@@ -123,7 +127,7 @@ fdtoverlay -i "${firmware_tree}/bcm2712-rpi-5-b.dtb" \
     -o "${owner_dtb}" "${work}/secure-boot.dtbo"
 
 bootcmd='fdt addr ${fdtcontroladdr}; if env print -e -n PK; then echo UEFI Secure Boot keys already enrolled; else '
-for variable in db dbx kek pk; do
+for variable in pk kek db dbx; do
     property=${variable}
     efi_variable=${variable}
     [[ ${variable} != kek ]] || efi_variable=KEK
