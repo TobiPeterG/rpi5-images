@@ -16,11 +16,25 @@ mkdir -p "${boot_tree}" "${key_dir}"
 chmod 0700 "${key_dir}"
 trap 'rm -rf -- "${work}"' EXIT
 
-source_parent=${CHROOT_SRCDIR:?}
-source_parent=${source_parent%/*}
-project_cert=${source_parent}/_projectcert.crt
+# mkosi uses /work/src for CHROOT_SRCDIR, whereas OBS injects its certificate
+# next to the package sources and mkosi-obs exposes that directory verbatim in
+# the sandbox. Locate the checked-out source tree as well, because OBS invokes
+# mkosi with --directory instead of from inside that tree.
+source_dir=
+for candidate in "${CHROOT_SRCDIR:?}" /usr/src/packages/SOURCES/*; do
+    if [[ -f ${candidate}/mkosi.finalize && -d ${candidate}/mkosi.keys ]]; then
+        source_dir=${candidate}
+        break
+    fi
+done
+[[ -n ${source_dir} ]] || {
+    echo "mkosi source tree not found" >&2
+    exit 1
+}
+
+project_cert=/usr/src/packages/SOURCES/_projectcert.crt
 if [[ ! -s ${project_cert} ]]; then
-    project_cert=${CHROOT_SRCDIR}/mkosi.keys/obs-project.crt
+    project_cert=${source_dir}/mkosi.keys/obs-project.crt
 fi
 [[ -s ${project_cert} ]] || {
     echo "OBS project certificate not found" >&2
@@ -30,7 +44,7 @@ fi
 # systemd-sysupdate verifies the repository's SHA256SUMS.gpg with this
 # keyring.
 install -d -m 0755 "${root}/usr/lib/systemd"
-base64 -d "${CHROOT_SRCDIR}/mkosi.keys/obs-project.pgp.b64" \
+base64 -d "${source_dir}/mkosi.keys/obs-project.pgp.b64" \
     > "${root}/usr/lib/systemd/import-pubring.pgp"
 chmod 0644 "${root}/usr/lib/systemd/import-pubring.pgp"
 
@@ -71,7 +85,7 @@ systemd_boot=${root}/efi/EFI/BOOT/BOOTAA64.EFI
     exit 1
 }
 
-extra_certs=("${CHROOT_SRCDIR}"/mkosi.keys/uefi-db/*.crt)
+extra_certs=("${source_dir}"/mkosi.keys/uefi-db/*.crt)
 index=0
 for cert in "${extra_certs[@]}"; do
     cert_to_esl "${cert}" "${key_dir}/db-${index}.esl"
@@ -93,7 +107,7 @@ for variable in PK KEK db; do
         "${variable}" "${key_dir}/${variable}.esl" "${key_dir}/${variable}.auth"
 done
 
-dbx_lists=("${CHROOT_SRCDIR}"/mkosi.keys/uefi-dbx/*.esl)
+dbx_lists=("${source_dir}"/mkosi.keys/uefi-dbx/*.esl)
 if (( ${#dbx_lists[@]} > 0 )); then
     command cat "${dbx_lists[@]}" > "${key_dir}/dbx.esl"
     sign-efi-sig-list -c "${envelope_cert}" -k "${envelope_key}" \
@@ -203,7 +217,7 @@ printf 'boot_ramdisk=1\n' > "${root}/efi/config.txt"
 
 # Signing boot.img is necessarily device-owner specific. Do it automatically
 # when the owner key and Raspberry Pi signing utility are supplied.
-rpi_key=${CHROOT_SRCDIR}/mkosi.keys/rpi-boot/private.pem
+rpi_key=${source_dir}/mkosi.keys/rpi-boot/private.pem
 if [[ -s ${rpi_key} ]] && command -v rpi-eeprom-digest >/dev/null; then
     rpi-eeprom-digest \
         -i "${root}/efi/boot.img" \
