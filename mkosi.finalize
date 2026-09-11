@@ -144,7 +144,7 @@ done
 bootcmd+='fi; env print -e SecureBoot; if load mmc 0:1 ${kernel_addr_r} /EFI/BOOT/BOOTAA64.EFI; then bootefi ${kernel_addr_r} ${fdtcontroladdr}; fi; echo ERROR: verified systemd-boot failed; reset'
 
 fdtput -p -t s "${owner_dtb}" /config bootcmd "${bootcmd}"
-fdtput -p -t i -- "${owner_dtb}" /config bootdelay -2
+fdtput -p -t i -- "${owner_dtb}" /config bootdelay 5
 install -m 0644 "${owner_dtb}" "${boot_tree}/owner-rpi5.dtb"
 
 sed -i '/^[[:space:]]*boot_ramdisk[[:space:]]*=/d' "${boot_tree}/config.txt"
