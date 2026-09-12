@@ -1,6 +1,21 @@
 #!/usr/bin/bash
 set -euo pipefail
 
+# The top-level mkosi-obs include cannot propagate its non-inheritable
+# post-output script into dependency images. Including all of mkosi-obs in a
+# dependency image is invalid because it also contains main-image-only
+# settings.
+obs_build=false
+if [[ -s /usr/src/packages/SOURCES/_projectcert.crt ]]; then
+    obs_build=true
+    obs_postoutput=$(python3 -c 'import importlib.resources; print(importlib.resources.files("mkosi") / "resources" / "mkosi-obs" / "mkosi.postoutput")')
+    [[ -f ${obs_postoutput} ]] || {
+        echo "mkosi-obs post-output helper not found: ${obs_postoutput}" >&2
+        exit 1
+    }
+    /usr/bin/bash "${obs_postoutput}"
+fi
+
 # Keep producing a desync index for the independently published EROFS root
 # partition.
 shopt -s nullglob
@@ -52,9 +67,7 @@ if [ ! -f "$disk" ]; then
     exit 1
 fi
 
-# mkosi post-output scripts run in a sandbox where /.build.binaries is not
-# visible. mkosi-obs exposes the OBS SOURCES directory
-if [[ -s /usr/src/packages/SOURCES/_projectcert.crt ]]; then
+if [[ ${obs_build} == true ]]; then
     recipe=${OUTPUTDIR}/mkosi.conf
     [[ -f ${recipe} ]] || {
         echo "mkosi-obs did not create its second-stage recipe before mkosi.postoutput" >&2
