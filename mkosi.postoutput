@@ -83,8 +83,10 @@ fi
 # In OBS, mkosi-obs creates a second-stage mkosi.conf that attaches the OBS
 # signatures to the UKI, bootloader and verity metadata. Compressing the disk
 # here would preserve the pre-signing disk and publish it alongside the final
-# raw image. Add a post-output helper to that generated recipe instead, so the
+# raw image. Add a second build script to that generated recipe instead, so the
 # flashable XZ image is made only after all signatures have been attached.
+# The mkosi-obs attachment stage uses Format=none, for which mkosi deliberately
+# skips post-output scripts.
 disk="$OUTPUTDIR/${IMAGE_ID}_${IMAGE_VERSION}_${ARCHITECTURE}.raw"
 
 if [ ! -f "$disk" ]; then
@@ -103,7 +105,7 @@ if [[ ${obs_build} == true ]]; then
     cat >> "${recipe}" <<'EOF'
 
 [Content]
-PostOutputScripts=%D/mkosi.final-output
+BuildScripts=%D/mkosi.final-output
 EOF
 else
     xz --threads=0 --keep --force "$disk"

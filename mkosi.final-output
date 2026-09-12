@@ -1,10 +1,14 @@
 #!/usr/bin/bash
 set -euo pipefail
 
-# This is run by the second mkosi-obs stage, after OBS signatures have been
-# attached and the final disk image has been reconstructed.
+# This is run as the final build script of the second mkosi-obs stage, after OBS
+# signatures have been attached and the final disk image has been reconstructed.
+# Build scripts do not receive OUTPUTDIR; mkosi-obs writes its results below the
+# source tree.
+output_dir=${OUTPUTDIR:-${SRCDIR:?}/usr/src/packages/OTHER}
+
 shopt -s nullglob
-disks=("${OUTPUTDIR}"/*_"${IMAGE_VERSION}"_"${ARCHITECTURE}".raw)
+disks=("${output_dir}"/*_"${IMAGE_VERSION}"_"${ARCHITECTURE}".raw)
 (( ${#disks[@]} > 0 )) || {
     echo "No final signed raw disk images found for ${IMAGE_VERSION}/${ARCHITECTURE}" >&2
     exit 1
@@ -13,7 +17,7 @@ disks=("${OUTPUTDIR}"/*_"${IMAGE_VERSION}"_"${ARCHITECTURE}".raw)
 for disk in "${disks[@]}"; do
     xz --threads=0 --keep --force "${disk}"
     (
-        cd "${OUTPUTDIR}"
+        cd "${output_dir}"
         sha256sum "$(basename "${disk}.xz")" > "$(basename "${disk}.xz").sha256"
     )
 done
