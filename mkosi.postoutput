@@ -70,6 +70,15 @@ for artifact in "${roots[0]}" "${verities[0]}"; do
     )
 done
 
+# mkosi-obs copies all first-stage artifacts into the signing-stage output and
+# then asks systemd-repart to split the signed disk again. Keeping these two
+# uncompressed split files would make systemd-repart refuse to overwrite them.
+# The compressed update artifacts and the desync index stay in place;
+# systemd-repart recreates the uncompressed split files from the disk.
+if [[ ${obs_build} == true ]]; then
+    rm -f -- "${roots[0]}" "${verities[0]}"
+fi
+
 
 # In OBS, mkosi-obs creates a second-stage mkosi.conf that attaches the OBS
 # signatures to the UKI, bootloader and verity metadata. Compressing the disk
