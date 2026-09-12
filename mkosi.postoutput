@@ -6,8 +6,24 @@ set -euo pipefail
 # dependency image is invalid because it also contains main-image-only
 # settings.
 obs_build=false
+source_dir=${SRCDIR:?}
 if [[ -s /usr/src/packages/SOURCES/_projectcert.crt ]]; then
     obs_build=true
+
+    # OBS invokes mkosi with --directory, but SRCDIR still refers to mkosi's
+    # /work/src sandbox directory rather than the extracted package sources.
+    source_dir=
+    for candidate in /usr/src/packages/SOURCES/*; do
+        if [[ -f ${candidate}/mkosi.postoutput && -f ${candidate}/mkosi.final-output ]]; then
+            source_dir=${candidate}
+            break
+        fi
+    done
+    [[ -n ${source_dir} ]] || {
+        echo "mkosi source tree containing mkosi.final-output not found" >&2
+        exit 1
+    }
+
     obs_postoutput=$(python3 -c 'import importlib.resources; print(importlib.resources.files("mkosi") / "resources" / "mkosi-obs" / "mkosi.postoutput")')
     [[ -f ${obs_postoutput} ]] || {
         echo "mkosi-obs post-output helper not found: ${obs_postoutput}" >&2
@@ -74,7 +90,7 @@ if [[ ${obs_build} == true ]]; then
         exit 1
     }
 
-    install -m 0755 "${SRCDIR}/mkosi.final-output" "${OUTPUTDIR}/mkosi.final-output"
+    install -m 0755 "${source_dir}/mkosi.final-output" "${OUTPUTDIR}/mkosi.final-output"
     cat >> "${recipe}" <<'EOF'
 
 [Content]
