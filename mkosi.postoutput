@@ -54,20 +54,24 @@ fi
 
 desync make --chunk-size 1024:2048:4096 "${roots[0]}.caibx" "${roots[0]}"
 
-# The mkosi checksum file is generated before post-output scripts run, so
-# create a checksum for the additional delta file here.
-(
-    cd "$OUTPUTDIR"
-    sha256sum "$(basename "${roots[0]}.caibx")" > "$(basename "${roots[0]}.caibx").sha256"
-)
+# OBS creates and signs the repository checksum manifest after the build. For
+# local builds, create standalone checksums for artifacts added by this script.
+if [[ ${obs_build} == false ]]; then
+    (
+        cd "$OUTPUTDIR"
+        sha256sum "$(basename "${roots[0]}.caibx")" > "$(basename "${roots[0]}.caibx").sha256"
+    )
+fi
 
 # support download compressed copies of the fixed-size slots.
 for artifact in "${roots[0]}" "${verities[0]}"; do
     xz --threads=0 --keep --force "${artifact}"
-    (
-        cd "$OUTPUTDIR"
-        sha256sum "$(basename "${artifact}.xz")" > "$(basename "${artifact}.xz").sha256"
-    )
+    if [[ ${obs_build} == false ]]; then
+        (
+            cd "$OUTPUTDIR"
+            sha256sum "$(basename "${artifact}.xz")" > "$(basename "${artifact}.xz").sha256"
+        )
+    fi
 done
 
 # mkosi-obs copies all first-stage artifacts into the signing-stage output and

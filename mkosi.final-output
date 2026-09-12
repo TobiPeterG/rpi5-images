@@ -16,8 +16,4 @@ disks=("${output_dir}"/*_"${IMAGE_VERSION}"_"${ARCHITECTURE}".raw)
 
 for disk in "${disks[@]}"; do
     xz --threads=0 --keep --force "${disk}"
-    (
-        cd "${output_dir}"
-        sha256sum "$(basename "${disk}.xz")" > "$(basename "${disk}.xz").sha256"
-    )
 done
