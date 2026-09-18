@@ -5,3 +5,4 @@
 /mkosi.pkgcache/
 /zypper/
 /.mkosi-private/
+__pycache__/
