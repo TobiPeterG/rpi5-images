@@ -5,6 +5,7 @@ import argparse
 import configparser
 from contextlib import contextmanager
 import difflib
+import fnmatch
 import json
 import os
 import re
@@ -102,38 +103,25 @@ def live_file(relative):
     return path
 
 
-def selection_file(name):
-    return STATE / "selections" / f"{checked_name(name)}.json"
+def selection_file():
+    return STATE / "index.json"
 
 
-def load_selection(name):
-    path = selection_file(name)
+def load_selection():
+    path = selection_file()
     if not path.exists():
-        # Migrate path-only selections written by the first, per-type version.
-        paths = []
-        for kind in KINDS:
-            legacy = path.with_name(f"{kind}-{name}.json")
-            if legacy.exists():
-                old = json.loads(legacy.read_text())
-                if old.get("name") != name or old.get("kind") != kind:
-                    fail(f"invalid legacy selection: {legacy}")
-                paths.extend(old["paths"])
-        if not paths:
-            fail(f"no selection: {name}")
-        data = {"name": name, "paths": sorted(set(paths))}
-        save_selection(data)
-        return data
+        return []
     data = json.loads(path.read_text())
-    if data.get("name") != name or not isinstance(data.get("paths"), list):
+    if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
         fail(f"invalid selection: {path}")
-    return data
+    return sorted(set(data))
 
 
-def save_selection(data):
-    path = selection_file(data["name"])
+def save_selection(paths):
+    path = selection_file()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.write_text(json.dumps(sorted(set(paths)), indent=2) + "\n")
     tmp.replace(path)
 
 
@@ -224,12 +212,12 @@ def command_diff(args):
             show_diff(base, relative_path(path, args.kind))
 
 
-def command_changes(args):
-    if ROOT != Path("/"):
-        fail("changes requires the live root filesystem")
-    if OVERLAY_UPPER is not None and os.path.ismount(OVERLAY_UPPER):
+def changed_paths(kind=None):
+    if OVERLAY_UPPER is not None and (ROOT != Path("/") or os.path.ismount(OVERLAY_UPPER)):
         upper = OVERLAY_UPPER
     else:
+        if ROOT != Path("/"):
+            fail("an accessible OverlayUpperDirectory is required for this root")
         options = subprocess.run(["findmnt", "-n", "-o", "OPTIONS", "/"], check=True, text=True, capture_output=True).stdout.strip()
         match = re.search(r"(?:^|,)upperdir=([^,]+)", options)
         if not match:
@@ -237,7 +225,8 @@ def command_changes(args):
         upper = Path(match.group(1))
     if not upper.is_dir():
         fail(f"overlay upperdir is not accessible: {upper}; a new UKI with the initrd upperdir hook is required")
-    prefixes = KINDS[args.kind] if args.kind else ("etc", "usr", "opt")
+    prefixes = KINDS[kind] if kind else ("etc", "usr", "opt")
+    changed = set()
     for prefix in prefixes:
         base = upper / prefix
         if not base.exists():
@@ -248,52 +237,77 @@ def command_changes(args):
                 if candidate.is_dir() and not candidate.is_symlink():
                     continue
                 relative = candidate.relative_to(upper)
-                print("/" + str(relative))
+                changed.add("/" + str(relative))
+    return sorted(changed)
+
+
+def command_changes(args):
+    for path in changed_paths(args.kind):
+        print(path)
+
+
+def expand_paths(patterns, kind=None):
+    changed = changed_paths(kind) if any(any(char in value for char in "*?[") for value in patterns) else []
+    selected = set()
+    for value in patterns:
+        if any(char in value for char in "*?["):
+            if value != "*" and not value.startswith("/"):
+                fail(f"expected an absolute path pattern or '*': {value}")
+            matches = [path for path in changed if fnmatch.fnmatchcase(path, value)]
+            if not matches:
+                fail(f"no changed files match: {value}")
+            selected.update(matches)
+        else:
+            selected.add("/" + str(relative_path(value, kind)))
+    return sorted(selected)
 
 
 def command_stage(args):
-    data = {"name": checked_name(args.name), "paths": []}
-    if selection_file(args.name).exists() or any(
-        selection_file(args.name).with_name(f"{kind}-{args.name}.json").exists() for kind in KINDS
-    ):
-        data = load_selection(args.name)
-    for value in args.paths:
-        relative = relative_path(value, args.kind)
-        live_file(relative)
-        normalized = "/" + str(relative)
-        if normalized not in data["paths"]:
-            data["paths"].append(normalized)
-    data["paths"].sort()
-    save_selection(data)
-    print(f"Selected {len(data['paths'])} path(s) for {args.name}; content will be read at build time")
+    paths = expand_paths(args.paths, args.kind)
+    for path in paths:
+        live_file(relative_path(path, args.kind))
+    selection = set(load_selection())
+    selection.update(paths)
+    save_selection(selection)
+    print(f"Staged {len(paths)} path(s); {len(selection)} total. Content will be read at build time")
 
 
 def command_unstage(args):
-    data = load_selection(args.name)
-    for value in args.paths:
-        path = "/" + str(relative_path(value, args.kind))
-        if path in data["paths"]:
-            data["paths"].remove(path)
-    save_selection(data)
-    print(f"Selected {len(data['paths'])} path(s)")
+    selection = set(load_selection())
+    for path in expand_paths(args.paths, args.kind):
+        selection.discard(path)
+    save_selection(selection)
+    print(f"{len(selection)} staged path(s) remain")
 
 
 def command_staged(args):
-    data = load_selection(args.name)
-    for path in data["paths"]:
+    for path in load_selection():
         relative = relative_path(path)
         kind = kind_for(relative)
         if args.kind is None or args.kind == kind:
             print(f"{kind}\t{path}")
 
 
+def command_status(args):
+    selection = set(load_selection())
+    changed = set(changed_paths(args.kind))
+    staged = sorted(path for path in selection if args.kind is None or kind_for(relative_path(path)) == args.kind)
+    print("Staged:")
+    for path in staged:
+        print(f"  {path}" + (" (missing from live root)" if not (ROOT / path.lstrip('/')).exists() and not (ROOT / path.lstrip('/')).is_symlink() else ""))
+    print("Unstaged:")
+    for path in sorted(changed - selection):
+        print(f"  {path}")
+
+
 def command_build(args):
+    checked_name(args.name)
     checked_name(args.version)
-    data = load_selection(args.name)
-    if not data["paths"]:
+    selection = load_selection()
+    if not selection:
         fail("selection is empty")
     grouped = {kind: [] for kind in KINDS}
-    for value in data["paths"]:
+    for value in selection:
         relative = relative_path(value)
         kind = kind_for(relative)
         if args.kind is None or args.kind == kind:
@@ -322,6 +336,8 @@ def command_build(args):
             output.parent.mkdir(parents=True, exist_ok=True)
             drafts[kind].replace(output)
             print(f"Built unsigned, disabled {kind} image: {output}")
+    built = {"/" + str(path) for paths in grouped.values() for path in paths}
+    save_selection(set(selection) - built)
 
 
 def command_list(args):
@@ -373,10 +389,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("/etc/extkit.conf"))
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("changes", "diff", "stage", "unstage", "staged", "build", "enable", "disable"):
+    for command in ("changes", "status", "diff", "stage", "unstage", "staged", "build", "enable", "disable"):
         p = sub.add_parser(command)
         p.add_argument("--type", dest="kind", choices=KINDS)
-        if command not in ("changes", "diff"):
+        if command in ("build", "enable", "disable"):
             p.add_argument("name")
         if command in ("diff", "stage", "unstage"):
             p.add_argument("paths", nargs="+")

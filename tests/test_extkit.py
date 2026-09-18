@@ -34,6 +34,7 @@ class ExtensionTest(unittest.TestCase):
             "[Paths]\n"
             f"StateDirectory={self.root / 'state'}\n"
             f"RootDirectory={self.root / 'live'}\n"
+            f"OverlayUpperDirectory={self.root / 'upper'}\n"
             f"BaseDirectory={self.root / 'base'}\n"
             "BaseFileSystem=erofs\n"
             f"RuntimeDirectory={self.root}\n"
@@ -42,6 +43,7 @@ class ExtensionTest(unittest.TestCase):
             "[Build]\nErofsTool=mkfs.erofs\n"
         )
         module.configure(config)
+        (self.root / "upper").mkdir()
         (module.ROOT / "etc").mkdir(parents=True)
         (self.root / "base/etc").mkdir(parents=True)
         (module.ROOT / "usr/lib").mkdir(parents=True)
@@ -60,10 +62,9 @@ class ExtensionTest(unittest.TestCase):
         self.assertIn("-old=1", output.getvalue())
         self.assertIn("+new=1", output.getvalue())
 
-        module.command_stage(SimpleNamespace(kind="confext", name="local", paths=["/etc/example.conf"]))
-        selection = module.load_selection("local")
-        self.assertEqual(selection["paths"], ["/etc/example.conf"])
-        self.assertNotIn("new=1", module.selection_file("local").read_text())
+        module.command_stage(SimpleNamespace(kind="confext", paths=["/etc/example.conf"]))
+        self.assertEqual(module.load_selection(), ["/etc/example.conf"])
+        self.assertNotIn("new=1", module.selection_file().read_text())
 
     def test_added_binary_symlink_and_unchanged_diffs(self):
         (module.ROOT / "etc/added.conf").write_text("added\n")
@@ -85,17 +86,17 @@ class ExtensionTest(unittest.TestCase):
         self.assertIn("UNCHANGED /etc/same", output.getvalue())
 
     def test_selection_duplicates_unstage_and_type_filter(self):
-        args = SimpleNamespace(kind=None, name="mixed", paths=[
+        args = SimpleNamespace(kind=None, paths=[
             "/etc/example.conf", "/etc/example.conf", "/usr/bin/example"
         ])
         module.command_stage(args)
-        self.assertEqual(len(module.load_selection("mixed")["paths"]), 2)
+        self.assertEqual(len(module.load_selection()), 2)
         output = io.StringIO()
         with redirect_stdout(output):
-            module.command_staged(SimpleNamespace(kind="sysext", name="mixed"))
+            module.command_staged(SimpleNamespace(kind="sysext"))
         self.assertEqual(output.getvalue(), "sysext\t/usr/bin/example\n")
-        module.command_unstage(SimpleNamespace(kind=None, name="mixed", paths=["/etc/example.conf"]))
-        self.assertEqual(module.load_selection("mixed")["paths"], ["/usr/bin/example"])
+        module.command_unstage(SimpleNamespace(kind=None, paths=["/etc/example.conf"]))
+        self.assertEqual(module.load_selection(), ["/usr/bin/example"])
         self.assertEqual((module.ROOT / "etc/example.conf").read_text(), "new=1\n")
 
     def test_invalid_paths_and_missing_staged_files(self):
@@ -107,26 +108,22 @@ class ExtensionTest(unittest.TestCase):
         (module.ROOT / "etc/alias").symlink_to("directory")
         for path in ("/etc/directory", "/etc/alias/file", "/etc/missing"):
             with self.subTest(path=path), self.assertRaises(ValueError):
-                module.command_stage(SimpleNamespace(kind=None, name="bad", paths=[path]))
-        module.command_stage(SimpleNamespace(kind=None, name="gone", paths=["/etc/example.conf"]))
+                module.command_stage(SimpleNamespace(kind=None, paths=[path]))
+        module.command_stage(SimpleNamespace(kind=None, paths=["/etc/example.conf"]))
         (module.ROOT / "etc/example.conf").unlink()
         with self.assertRaises(ValueError):
             module.command_build(SimpleNamespace(kind=None, name="gone", version="1"))
         self.assertFalse((module.store_dir("confext") / "gone_1.raw").exists())
 
-    def test_legacy_selection_migration(self):
-        selection_dir = module.STATE / "selections"
-        selection_dir.mkdir(parents=True)
-        for kind, path in (("confext", "/etc/example.conf"), ("sysext", "/usr/bin/example")):
-            (selection_dir / f"{kind}-old.json").write_text(json.dumps({
-                "kind": kind, "name": "old", "paths": [path]
-            }))
-        self.assertEqual(module.load_selection("old")["paths"],
-                         ["/etc/example.conf", "/usr/bin/example"])
-        self.assertTrue((selection_dir / "old.json").is_file())
+    def test_empty_selection_and_index_validation(self):
+        self.assertEqual(module.load_selection(), [])
+        module.selection_file().parent.mkdir(parents=True)
+        module.selection_file().write_text('{"paths": []}')
+        with self.assertRaises(ValueError):
+            module.load_selection()
 
     def test_build_uses_content_at_build_time_and_stays_disabled(self):
-        module.command_stage(SimpleNamespace(kind="confext", name="local", paths=["/etc/example.conf"]))
+        module.command_stage(SimpleNamespace(kind="confext", paths=["/etc/example.conf"]))
         (module.ROOT / "etc/example.conf").write_text("later=2\n")
 
         def fake_erofs(command, check):
@@ -139,6 +136,7 @@ class ExtensionTest(unittest.TestCase):
             module.command_build(SimpleNamespace(kind=None, name="local", version="1"))
         image = module.store_dir("confext") / "local_1.raw"
         self.assertEqual(image.read_bytes(), b"test-image")
+        self.assertEqual(module.load_selection(), [])
 
     def test_rejects_wrong_tree_and_missing_image(self):
         with self.assertRaises(ValueError):
@@ -150,7 +148,7 @@ class ExtensionTest(unittest.TestCase):
         packaged = SCRIPT.parents[2] / "etc/extkit.conf"
         module.configure(packaged)
         self.assertEqual(module.STATE, Path("/.state/extkit"))
-        self.assertEqual(module.OVERLAY_UPPER, Path("/.overlay-upper/upper"))
+        self.assertEqual(module.OVERLAY_UPPER, Path("/.overlay/upper"))
         self.assertEqual(module.BASE_DEVICE, Path("/dev/mapper/root"))
         self.assertEqual(module.enabled_dir("confext"), Path("/var/lib/confexts"))
 
@@ -169,7 +167,7 @@ class ExtensionTest(unittest.TestCase):
         script = module.ROOT / "usr/bin/example"
         script.chmod(0o751)
         (module.ROOT / "etc/example-link").symlink_to("example.conf")
-        module.command_stage(SimpleNamespace(kind=None, name="metadata", paths=[
+        module.command_stage(SimpleNamespace(kind=None, paths=[
             "/usr/bin/example", "/etc/example-link"
         ]))
 
@@ -189,7 +187,7 @@ class ExtensionTest(unittest.TestCase):
             module.command_build(SimpleNamespace(kind=None, name="metadata", version="1"))
 
     def test_build_type_filter_existing_version_and_failure_cleanup(self):
-        module.command_stage(SimpleNamespace(kind=None, name="mixed", paths=[
+        module.command_stage(SimpleNamespace(kind=None, paths=[
             "/etc/example.conf", "/usr/bin/example"
         ]))
 
@@ -200,8 +198,11 @@ class ExtensionTest(unittest.TestCase):
             module.command_build(SimpleNamespace(kind="sysext", name="mixed", version="1"))
         self.assertTrue((module.store_dir("sysext") / "mixed_1.raw").exists())
         self.assertFalse((module.store_dir("confext") / "mixed_1.raw").exists())
+        self.assertEqual(module.load_selection(), ["/etc/example.conf"])
         with self.assertRaises(ValueError):
             module.command_build(SimpleNamespace(kind="sysext", name="mixed", version="1"))
+
+        module.command_stage(SimpleNamespace(kind=None, paths=["/usr/bin/example"]))
 
         def fail_second(command, check):
             if Path(command[1]).name == "confext.raw":
@@ -284,6 +285,32 @@ class ExtensionTest(unittest.TestCase):
                 module.command_changes(SimpleNamespace(kind=None))
         self.assertEqual(output.getvalue(), "/etc/changed.conf\n")
 
+    def test_status_and_glob_staging(self):
+        upper = self.root / "upper"
+        for path in ("etc/example.conf", "usr/bin/example"):
+            target = upper / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("changed")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_status(SimpleNamespace(kind=None))
+        self.assertIn("Unstaged:\n  /etc/example.conf\n  /usr/bin/example", output.getvalue())
+
+        module.command_stage(SimpleNamespace(kind=None, paths=["/etc/*"]))
+        self.assertEqual(module.load_selection(), ["/etc/example.conf"])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_status(SimpleNamespace(kind=None))
+        self.assertIn("Staged:\n  /etc/example.conf", output.getvalue())
+        self.assertIn("Unstaged:\n  /usr/bin/example", output.getvalue())
+
+        module.command_stage(SimpleNamespace(kind=None, paths=["*"]))
+        self.assertEqual(module.load_selection(), ["/etc/example.conf", "/usr/bin/example"])
+        module.command_unstage(SimpleNamespace(kind=None, paths=["/etc/*"]))
+        self.assertEqual(module.load_selection(), ["/usr/bin/example"])
+        with self.assertRaises(ValueError):
+            module.command_stage(SimpleNamespace(kind=None, paths=["/opt/*"]))
+
     def test_initrd_upper_hook_is_present_and_valid_shell(self):
         root = SCRIPT.parents[3]
         hook = root / "mkosi.initrd.extra/usr/libexec/extkit-volatile-root"
@@ -299,19 +326,18 @@ class ExtensionTest(unittest.TestCase):
                 check=True, text=True, capture_output=True,
             ).stdout
 
-        cli("stage", "cli-test", "/etc/example.conf", "/usr/bin/example")
-        self.assertEqual(module.load_selection("cli-test")["paths"],
-                         ["/etc/example.conf", "/usr/bin/example"])
-        self.assertEqual(cli("staged", "cli-test", "--type", "confext"),
+        cli("stage", "/etc/example.conf", "/usr/bin/example")
+        self.assertEqual(module.load_selection(), ["/etc/example.conf", "/usr/bin/example"])
+        self.assertEqual(cli("staged", "--type", "confext"),
                          "confext\t/etc/example.conf\n")
-        cli("unstage", "cli-test", "/usr/bin/example")
-        self.assertEqual(cli("staged", "cli-test"), "confext\t/etc/example.conf\n")
+        cli("unstage", "/usr/bin/example")
+        self.assertEqual(cli("staged"), "confext\t/etc/example.conf\n")
 
     def test_mixed_selection_builds_and_enables_two_images(self):
         module.command_stage(SimpleNamespace(
-            kind=None, name="mixed", paths=["/etc/example.conf", "/usr/bin/example"]
+            kind=None, paths=["/etc/example.conf", "/usr/bin/example"]
         ))
-        self.assertEqual(module.load_selection("mixed")["paths"],
+        self.assertEqual(module.load_selection(),
                          ["/etc/example.conf", "/usr/bin/example"])
 
         def fake_erofs(command, check):
@@ -344,7 +370,7 @@ class ExtensionTest(unittest.TestCase):
             self.skipTest("erofs-utils is not available")
         module.EROFS_TOOL = mkfs
         module.command_stage(SimpleNamespace(
-            kind=None, name="local", paths=["/etc/example.conf", "/usr/bin/example"]
+            kind=None, paths=["/etc/example.conf", "/usr/bin/example"]
         ))
         module.command_build(SimpleNamespace(kind=None, name="local", version="1"))
         images = {kind: module.store_dir(kind) / "local_1.raw" for kind in module.KINDS}
