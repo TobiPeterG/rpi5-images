@@ -150,6 +150,7 @@ class ExtensionTest(unittest.TestCase):
         packaged = SCRIPT.parents[2] / "etc/extkit.conf"
         module.configure(packaged)
         self.assertEqual(module.STATE, Path("/.state/extkit"))
+        self.assertEqual(module.OVERLAY_UPPER, Path("/.overlay-upper/upper"))
         self.assertEqual(module.BASE_DEVICE, Path("/dev/mapper/root"))
         self.assertEqual(module.enabled_dir("confext"), Path("/var/lib/confexts"))
 
@@ -269,6 +270,27 @@ class ExtensionTest(unittest.TestCase):
             with redirect_stdout(output):
                 module.command_changes(SimpleNamespace(kind="confext"))
         self.assertEqual(output.getvalue(), "/etc/changed.conf\n")
+
+    def test_changes_uses_exposed_upper_without_scanning_live_root(self):
+        upper = self.root / "exposed-upper"
+        (upper / "etc").mkdir(parents=True)
+        (upper / "etc/changed.conf").write_text("changed")
+        output = io.StringIO()
+        with patch.object(module, "ROOT", Path("/")), \
+             patch.object(module, "OVERLAY_UPPER", upper), \
+             patch.object(module.os.path, "ismount", return_value=True), \
+             patch.object(module.subprocess, "run", side_effect=AssertionError("findmnt should not run")):
+            with redirect_stdout(output):
+                module.command_changes(SimpleNamespace(kind=None))
+        self.assertEqual(output.getvalue(), "/etc/changed.conf\n")
+
+    def test_initrd_upper_hook_is_present_and_valid_shell(self):
+        root = SCRIPT.parents[3]
+        hook = root / "mkosi.initrd.extra/usr/libexec/extkit-volatile-root"
+        unit = root / "mkosi.initrd.extra/etc/systemd/system/systemd-volatile-root.service.d/10-extkit-upper.conf"
+        self.assertTrue(os.access(hook, os.X_OK))
+        subprocess.run(["bash", "-n", str(hook)], check=True)
+        self.assertIn("ExecStart=/usr/libexec/extkit-volatile-root", unit.read_text())
 
     def test_cli_with_temp_configuration(self):
         def cli(*arguments):

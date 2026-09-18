@@ -1,0 +1,41 @@
+#!/usr/bin/bash
+# Create the usual volatile root overlay, retaining a read-only view of its
+# upper directory inside the switched-to root.
+set -u
+
+sysroot=/sysroot
+backing=/run/systemd/overlay-sysroot
+view=${sysroot}/.overlay/upper
+
+fallback() {
+    echo "extkit: custom overlay setup failed; using systemd-volatile-root" >&2
+    exec /usr/lib/systemd/systemd-volatile-root yes "${sysroot}"
+}
+
+if [[ ! -e /run/systemd/volatile-root && ! -L /run/systemd/volatile-root ]]; then
+    ln -s /dev/mapper/root /run/systemd/volatile-root || true
+fi
+
+[[ -d ${view} ]] || fallback
+mkdir -p "${backing}" || fallback
+mount -t tmpfs -o mode=0755,size=50% tmpfs "${backing}" || fallback
+if ! mkdir -p "${backing}/upper" "${backing}/work"; then
+    umount "${backing}" || true
+    fallback
+fi
+if ! mount -t overlay overlay -o "lowerdir=${sysroot},upperdir=${backing}/upper,workdir=${backing}/work" "${sysroot}"; then
+    umount "${backing}" || true
+    fallback
+fi
+
+if mount --bind "${backing}/upper" "${view}"; then
+    if ! mount -o remount,bind,ro,nodev,nosuid,noexec "${view}"; then
+        echo "extkit: upper view could not be made read-only; hiding it" >&2
+        umount "${view}" || true
+    fi
+else
+    echo "extkit: upper view unavailable; root overlay remains usable" >&2
+fi
+
+umount "${backing}" || true
+exit 0

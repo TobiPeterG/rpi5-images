@@ -20,6 +20,7 @@ ROOT = None
 BASE_DIRECTORY = None
 BASE_DEVICE = None
 BASE_FSTYPE = None
+OVERLAY_UPPER = None
 RUNTIME_DIRECTORY = None
 ENABLED_DIRS = {}
 EROFS_TOOL = None
@@ -28,7 +29,7 @@ NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 
 
 def configure(path):
-    global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE
+    global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPER
     global RUNTIME_DIRECTORY, ENABLED_DIRS, EROFS_TOOL
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path):
@@ -36,6 +37,7 @@ def configure(path):
     paths = config["Paths"]
     STATE = Path(paths["StateDirectory"])
     ROOT = Path(paths["RootDirectory"])
+    OVERLAY_UPPER = Path(paths["OverlayUpperDirectory"]) if paths.get("OverlayUpperDirectory") else None
     BASE_DIRECTORY = Path(paths["BaseDirectory"]) if paths.get("BaseDirectory") else None
     BASE_DEVICE = Path(paths["BaseDevice"]) if paths.get("BaseDevice") else None
     BASE_FSTYPE = paths["BaseFileSystem"]
@@ -54,6 +56,8 @@ def configure(path):
     for name, value in (("BaseDirectory", BASE_DIRECTORY), ("BaseDevice", BASE_DEVICE)):
         if value is not None and not value.is_absolute():
             fail(f"{name} must be an absolute path: {value}")
+    if OVERLAY_UPPER is not None and not OVERLAY_UPPER.is_absolute():
+        fail(f"OverlayUpperDirectory must be an absolute path: {OVERLAY_UPPER}")
 
 
 def fail(message):
@@ -223,13 +227,16 @@ def command_diff(args):
 def command_changes(args):
     if ROOT != Path("/"):
         fail("changes requires the live root filesystem")
-    options = subprocess.run(["findmnt", "-n", "-o", "OPTIONS", "/"], check=True, text=True, capture_output=True).stdout.strip()
-    match = re.search(r"(?:^|,)upperdir=([^,]+)", options)
-    if not match:
-        fail("/ is not an overlay mount with an accessible upperdir")
-    upper = Path(match.group(1))
+    if OVERLAY_UPPER is not None and os.path.ismount(OVERLAY_UPPER):
+        upper = OVERLAY_UPPER
+    else:
+        options = subprocess.run(["findmnt", "-n", "-o", "OPTIONS", "/"], check=True, text=True, capture_output=True).stdout.strip()
+        match = re.search(r"(?:^|,)upperdir=([^,]+)", options)
+        if not match:
+            fail("/ is not an overlay mount with an accessible upperdir")
+        upper = Path(match.group(1))
     if not upper.is_dir():
-        fail(f"overlay upperdir is not accessible: {upper}")
+        fail(f"overlay upperdir is not accessible: {upper}; a new UKI with the initrd upperdir hook is required")
     prefixes = KINDS[args.kind] if args.kind else ("etc", "usr", "opt")
     for prefix in prefixes:
         base = upper / prefix

@@ -10,6 +10,8 @@ set -euo pipefail
 : > /etc/fstab
 : > /etc/machine-id
 install -d -m 0755 /etc/systemd/journald.conf.d /efi/loader /home /var/log /var/lib/extensions /var/lib/confexts
+install -d -m 0700 /.overlay
+install -d -m 0700 /.overlay/upper
 cat > /etc/systemd/journald.conf.d/10-persistent-log.conf <<'EOF'
 [Journal]
 Storage=persistent
