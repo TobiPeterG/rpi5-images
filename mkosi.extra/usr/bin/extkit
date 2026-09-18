@@ -22,6 +22,7 @@ BASE_DIRECTORY = None
 BASE_DEVICE = None
 BASE_FSTYPE = None
 OVERLAY_UPPER = None
+CONFEXT_UPPER = None
 RUNTIME_DIRECTORY = None
 ENABLED_DIRS = {}
 EROFS_TOOL = None
@@ -30,7 +31,7 @@ NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 
 
 def configure(path):
-    global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPER
+    global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPER, CONFEXT_UPPER
     global RUNTIME_DIRECTORY, ENABLED_DIRS, EROFS_TOOL
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path):
@@ -39,6 +40,7 @@ def configure(path):
     STATE = Path(paths["StateDirectory"])
     ROOT = Path(paths["RootDirectory"])
     OVERLAY_UPPER = Path(paths["OverlayUpperDirectory"]) if paths.get("OverlayUpperDirectory") else None
+    CONFEXT_UPPER = Path(paths["ConfextUpperDirectory"]) if paths.get("ConfextUpperDirectory") else None
     BASE_DIRECTORY = Path(paths["BaseDirectory"]) if paths.get("BaseDirectory") else None
     BASE_DEVICE = Path(paths["BaseDevice"]) if paths.get("BaseDevice") else None
     BASE_FSTYPE = paths["BaseFileSystem"]
@@ -59,6 +61,8 @@ def configure(path):
             fail(f"{name} must be an absolute path: {value}")
     if OVERLAY_UPPER is not None and not OVERLAY_UPPER.is_absolute():
         fail(f"OverlayUpperDirectory must be an absolute path: {OVERLAY_UPPER}")
+    if CONFEXT_UPPER is not None and not CONFEXT_UPPER.is_absolute():
+        fail(f"ConfextUpperDirectory must be an absolute path: {CONFEXT_UPPER}")
 
 
 def fail(message):
@@ -227,17 +231,22 @@ def changed_paths(kind=None):
         fail(f"overlay upperdir is not accessible: {upper}; a new UKI with the initrd upperdir hook is required")
     prefixes = KINDS[kind] if kind else ("etc", "usr", "opt")
     changed = set()
-    for prefix in prefixes:
-        base = upper / prefix
-        if not base.exists():
-            continue
+    def scan(base, prefix):
+        if not base.is_dir():
+            return
         for directory, names, files in os.walk(base, followlinks=False):
             for name in sorted(names + files):
                 candidate = Path(directory) / name
                 if candidate.is_dir() and not candidate.is_symlink():
                     continue
-                relative = candidate.relative_to(upper)
-                changed.add("/" + str(relative))
+                changed.add("/" + str(Path(prefix) / candidate.relative_to(base)))
+    for prefix in prefixes:
+        scan(upper / prefix, prefix)
+    # A merged confext has its own writable overlay, independent of the
+    # volatile root overlay. Map its upper files back to their /etc paths.
+    if "etc" in prefixes and CONFEXT_UPPER is not None and CONFEXT_UPPER.is_dir():
+        if ROOT != Path("/") or os.path.ismount(CONFEXT_UPPER.parent):
+            scan(CONFEXT_UPPER, "etc")
     return sorted(changed)
 
 

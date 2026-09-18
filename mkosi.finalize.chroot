@@ -10,6 +10,7 @@ set -euo pipefail
 : > /etc/fstab
 : > /etc/machine-id
 install -d -m 0755 /etc/systemd/journald.conf.d /efi/loader /home /var/log /var/lib/extensions /var/lib/confexts
+install -d -m 0700 /var/lib/extensions.mutable
 install -d -m 0700 /.overlay
 install -d -m 0700 /.overlay/upper
 cat > /etc/systemd/journald.conf.d/10-persistent-log.conf <<'EOF'
@@ -28,6 +29,7 @@ systemctl enable sshd.service
 systemctl enable serial-getty@ttyAMA10.service
 systemctl enable systemd-sysext.service
 systemctl enable systemd-confext.service
+systemctl enable var-lib-extensions.mutable.mount
 
 # Run the interactive JeOS configuration wizard.
 # the wizard runs again after every reboot.

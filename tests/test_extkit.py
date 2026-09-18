@@ -35,6 +35,7 @@ class ExtensionTest(unittest.TestCase):
             f"StateDirectory={self.root / 'state'}\n"
             f"RootDirectory={self.root / 'live'}\n"
             f"OverlayUpperDirectory={self.root / 'upper'}\n"
+            f"ConfextUpperDirectory={self.root / 'confext-upper'}\n"
             f"BaseDirectory={self.root / 'base'}\n"
             "BaseFileSystem=erofs\n"
             f"RuntimeDirectory={self.root}\n"
@@ -149,6 +150,7 @@ class ExtensionTest(unittest.TestCase):
         module.configure(packaged)
         self.assertEqual(module.STATE, Path("/.state/extkit"))
         self.assertEqual(module.OVERLAY_UPPER, Path("/.overlay/upper"))
+        self.assertEqual(module.CONFEXT_UPPER, Path("/var/lib/extensions.mutable/etc"))
         self.assertEqual(module.BASE_DEVICE, Path("/dev/mapper/root"))
         self.assertEqual(module.enabled_dir("confext"), Path("/var/lib/confexts"))
 
@@ -310,6 +312,22 @@ class ExtensionTest(unittest.TestCase):
         self.assertEqual(module.load_selection(), ["/usr/bin/example"])
         with self.assertRaises(ValueError):
             module.command_stage(SimpleNamespace(kind=None, paths=["/opt/*"]))
+
+    def test_confext_upper_changes_are_staged_as_etc_paths(self):
+        confext = self.root / "confext-upper"
+        confext.mkdir()
+        (confext / "example.conf").write_text("changed after confext merge")
+        self.assertEqual(module.changed_paths("confext"), ["/etc/example.conf"])
+        module.command_stage(SimpleNamespace(kind=None, paths=["/etc/*"]))
+        self.assertEqual(module.load_selection(), ["/etc/example.conf"])
+
+    def test_mutable_confext_uses_separate_volatile_upper(self):
+        root = SCRIPT.parents[3]
+        unit = root / "mkosi.extra/usr/lib/systemd/system/systemd-confext.service.d/10-volatile-writes.conf"
+        mount = root / "mkosi.extra/usr/lib/systemd/system/var-lib-extensions.mutable.mount"
+        self.assertIn("SYSTEMD_CONFEXT_MUTABLE_MODE=enabled", unit.read_text())
+        self.assertIn("What=tmpfs", mount.read_text())
+        self.assertIn("Where=/var/lib/extensions.mutable", mount.read_text())
 
     def test_initrd_upper_hook_is_present_and_valid_shell(self):
         root = SCRIPT.parents[3]
