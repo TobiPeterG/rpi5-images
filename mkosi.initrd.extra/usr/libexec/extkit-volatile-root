@@ -12,8 +12,40 @@ fallback() {
     exec /usr/lib/systemd/systemd-volatile-root yes "${sysroot}"
 }
 
+find_originating_partition() {
+    local devnum=${1:?} slave slave_devnum
+
+    if [[ -e /sys/dev/block/${devnum}/partition ]]; then
+        printf '%s\n' "${devnum}"
+        return 0
+    fi
+
+    for slave in /sys/dev/block/${devnum}/slaves/*; do
+        [[ -e ${slave}/dev ]] || continue
+        read -r slave_devnum < "${slave}/dev" || continue
+        find_originating_partition "${slave_devnum}" && return 0
+    done
+    return 1
+}
+
 if [[ ! -e /run/systemd/volatile-root && ! -L /run/systemd/volatile-root ]]; then
-    ln -s /dev/mapper/root /run/systemd/volatile-root || true
+    # Consumers such as systemd-gpt-auto-generator and systemd-sysupdate parse
+    # this as an originating partition in canonical /dev/block/MAJOR:MINOR
+    # form. Pointing at the dm-verity mapper itself is insufficient: systemd
+    # cannot derive the physical whole disk from that virtual whole device.
+    if device_hex=$(stat -Lc '%t:%T' /dev/mapper/root 2>/dev/null); then
+        major_hex=${device_hex%%:*}
+        minor_hex=${device_hex##*:}
+        printf -v mapper_devnum '%d:%d' \
+            "$((16#${major_hex}))" "$((16#${minor_hex}))"
+        if partition_devnum=$(find_originating_partition "${mapper_devnum}"); then
+            ln -s "/dev/block/${partition_devnum}" /run/systemd/volatile-root || true
+        else
+            echo "extkit: could not find the originating root partition" >&2
+        fi
+    else
+        echo "extkit: could not determine the volatile root block device" >&2
+    fi
 fi
 
 [[ -d ${view} ]] || fallback

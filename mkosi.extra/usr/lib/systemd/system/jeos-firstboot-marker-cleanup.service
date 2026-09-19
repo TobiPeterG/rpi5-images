@@ -1,0 +1,12 @@
+[Unit]
+Description=Mark the SUSE JeOS first-boot wizard as complete
+ConditionPathExists=/var/lib/YaST2/reconfig_system
+Requires=jeos-firstboot.service
+After=jeos-firstboot.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rm -f /var/lib/YaST2/reconfig_system
+
+[Install]
+WantedBy=default.target

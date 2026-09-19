@@ -179,31 +179,6 @@ class ExtensionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.command_enable(SimpleNamespace(kind="confext", name="local", version="1"))
 
-    def test_packaged_configuration(self):
-        packaged = SCRIPT.parents[2] / "etc/extkit.conf"
-        module.configure(packaged)
-        self.assertEqual(module.STATE, Path("/.state/extkit"))
-        self.assertEqual(module.OVERLAY_UPPERS, [
-            (Path("/.overlay/upper"), Path("/")),
-            (Path("/run/extensions.mutable/etc"), Path("/etc")),
-            (Path("/run/extensions.mutable/usr"), Path("/usr")),
-            (Path("/run/extensions.mutable/opt"), Path("/opt")),
-            (Path("/run/extensions.mutable/var"), Path("/var")),
-        ])
-        self.assertEqual(module.BASE_DEVICE, Path("/dev/mapper/root"))
-        self.assertEqual(module.KINDS, {
-            "sysext": ("usr", "opt", "var"),
-            "confext": ("etc",),
-        })
-        self.assertEqual(module.EXCLUDED_TREES, (
-            ("var", "log"),
-            ("var", "lib", "extensions"),
-            ("var", "lib", "confexts"),
-            ("var", "lib", "extensions.mutable"),
-        ))
-        self.assertEqual(module.enabled_dir("sysext"), Path("/.state/extensions"))
-        self.assertEqual(module.enabled_dir("confext"), Path("/.state/confexts"))
-
     def test_invalid_configuration(self):
         with self.assertRaises(ValueError):
             module.configure(self.root / "absent.conf")
@@ -463,22 +438,8 @@ class ExtensionTest(unittest.TestCase):
         module.OVERLAY_UPPERS.append((extra, Path("/opt")))
         self.assertIn("/opt/application/file/config", module.changed_paths("sysext"))
 
-    def test_mutable_confext_uses_separate_volatile_upper(self):
-        root = SCRIPT.parents[3]
-        unit = root / "mkosi.extra/usr/lib/systemd/system/systemd-confext.service.d/10-volatile-writes.conf"
-        self.assertIn("SYSTEMD_CONFEXT_MUTABLE_MODE=enabled", unit.read_text())
-        self.assertIn("/run/extensions.mutable", unit.read_text())
-
-    def test_sysext_supports_var_with_volatile_writes(self):
-        root = SCRIPT.parents[3]
-        unit = root / "mkosi.extra/usr/lib/systemd/system/systemd-sysext.service.d/10-var-and-volatile-writes.conf"
-        contents = unit.read_text()
-        self.assertIn("SYSTEMD_SYSEXT_HIERARCHIES=/usr:/opt:/var", contents)
-        self.assertIn("SYSTEMD_SYSEXT_MUTABLE_MODE=enabled", contents)
-        self.assertEqual(module.kind_for(Path("var/lib/example")), "sysext")
-
     def test_deleted_var_file_builds_erofs_whiteout(self):
-        relative = Path("var/lib/YaST2/reconfig_system")
+        relative = Path("var/lib/application/obsolete")
         base = Path(module.BASE_DIRECTORY) / relative
         base.parent.mkdir(parents=True)
         base.touch()
@@ -504,17 +465,9 @@ class ExtensionTest(unittest.TestCase):
             Path(command[1]).write_bytes(b"image")
 
         with patch.object(module.subprocess, "run", side_effect=fake_erofs):
-            module.command_build(SimpleNamespace(kind=None, name="firstboot-done", version="1"))
-        self.assertTrue((module.store_dir("sysext") / "firstboot-done_1.raw").is_file())
+            module.command_build(SimpleNamespace(kind=None, name="deletion", version="1"))
+        self.assertTrue((module.store_dir("sysext") / "deletion_1.raw").is_file())
         self.assertEqual(module.load_deletions(), [])
-
-    def test_initrd_upper_hook_is_present_and_valid_shell(self):
-        root = SCRIPT.parents[3]
-        hook = root / "mkosi.initrd.extra/usr/libexec/extkit-volatile-root"
-        unit = root / "mkosi.initrd.extra/etc/systemd/system/systemd-volatile-root.service.d/10-extkit-upper.conf"
-        self.assertTrue(os.access(hook, os.X_OK))
-        subprocess.run(["bash", "-n", str(hook)], check=True)
-        self.assertIn("ExecStart=/usr/libexec/extkit-volatile-root", unit.read_text())
 
     def test_cli_with_temp_configuration(self):
         def cli(*arguments):

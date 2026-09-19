@@ -46,6 +46,7 @@ systemctl mask systemd-firstboot.service
 # There is no persistent root snapshot to create for the tmpfs overlay.
 systemctl mask jeos-firstboot-snapshot.service
 systemctl enable jeos-firstboot.service
+systemctl enable jeos-firstboot-marker-cleanup.service
 
 # mkosi discovers kernels below /usr/lib/modules, while openSUSE installs the
 # arm64 boot image below /boot and leaves only vmlinux.xz in the module tree.
