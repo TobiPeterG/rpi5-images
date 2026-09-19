@@ -9,6 +9,10 @@ set -euo pipefail
 # The verified root is overlaid with tmpfs at boot.
 : > /etc/fstab
 : > /etc/machine-id
+# openSUSE MicroOS currently publishes SYSEXT_LEVEL but no CONFEXT_LEVEL.
+if ! grep -q '^CONFEXT_LEVEL=' /usr/lib/os-release; then
+    printf '\nCONFEXT_LEVEL=microos-confext-1\n' >> /usr/lib/os-release
+fi
 install -d -m 0755 /etc/systemd/journald.conf.d /efi/loader /home /var/log /var/lib/extensions /var/lib/confexts
 if [[ -d /var/lib/extensions.mutable && ! -L /var/lib/extensions.mutable ]]; then
     rmdir /var/lib/extensions.mutable
@@ -25,7 +29,9 @@ cat > /etc/systemd/journald.conf.d/10-persistent-log.conf <<'EOF'
 Storage=persistent
 EOF
 cat > /efi/loader/loader.conf <<'EOF'
-timeout 0
+# Keep the recovery UKI profile reachable without requiring precisely timed
+# key input while firmware and systemd-boot hand over control.
+timeout 3
 editor no
 auto-entries no
 auto-firmware no

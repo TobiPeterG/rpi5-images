@@ -20,7 +20,7 @@ Before=shutdown.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStartPre=+/usr/bin/install -d -m 0700 /run/extensions.mutable
-ExecStartPre=+/usr/bin/ln -sfn /.state/extensions /run/extensions
+ExecStartPre=+/usr/bin/extkit activate --type sysext
 Environment=SYSTEMD_SYSEXT_HIERARCHIES=/usr:/opt:/var
 Environment=SYSTEMD_SYSEXT_MUTABLE_MODE=yes
 ExecStart=systemd-sysext refresh
