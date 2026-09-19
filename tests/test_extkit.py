@@ -34,8 +34,9 @@ class ExtensionTest(unittest.TestCase):
             "[Paths]\n"
             f"StateDirectory={self.root / 'state'}\n"
             f"RootDirectory={self.root / 'live'}\n"
-            f"OverlayUpperDirectory={self.root / 'upper'}\n"
-            f"ConfextUpperDirectory={self.root / 'confext-upper'}\n"
+            "OverlayUpperDirectories=\n"
+            f"    {self.root / 'upper'} /\n"
+            f"    {self.root / 'confext-upper'} /etc\n"
             f"BaseDirectory={self.root / 'base'}\n"
             "BaseFileSystem=erofs\n"
             f"RuntimeDirectory={self.root}\n"
@@ -149,8 +150,10 @@ class ExtensionTest(unittest.TestCase):
         packaged = SCRIPT.parents[2] / "etc/extkit.conf"
         module.configure(packaged)
         self.assertEqual(module.STATE, Path("/.state/extkit"))
-        self.assertEqual(module.OVERLAY_UPPER, Path("/.overlay/upper"))
-        self.assertEqual(module.CONFEXT_UPPER, Path("/var/lib/extensions.mutable/etc"))
+        self.assertEqual(module.OVERLAY_UPPERS, [
+            (Path("/.overlay/upper"), Path("/")),
+            (Path("/var/lib/extensions.mutable/etc"), Path("/etc")),
+        ])
         self.assertEqual(module.BASE_DEVICE, Path("/dev/mapper/root"))
         self.assertEqual(module.enabled_dir("confext"), Path("/var/lib/confexts"))
 
@@ -280,8 +283,7 @@ class ExtensionTest(unittest.TestCase):
         (upper / "etc/changed.conf").write_text("changed")
         output = io.StringIO()
         with patch.object(module, "ROOT", Path("/")), \
-             patch.object(module, "OVERLAY_UPPER", upper), \
-             patch.object(module.os.path, "ismount", return_value=True), \
+             patch.object(module, "OVERLAY_UPPERS", [(upper, Path("/"))]), \
              patch.object(module.subprocess, "run", side_effect=AssertionError("findmnt should not run")):
             with redirect_stdout(output):
                 module.command_changes(SimpleNamespace(kind=None))
@@ -320,6 +322,13 @@ class ExtensionTest(unittest.TestCase):
         self.assertEqual(module.changed_paths("confext"), ["/etc/example.conf"])
         module.command_stage(SimpleNamespace(kind=None, paths=["/etc/*"]))
         self.assertEqual(module.load_selection(), ["/etc/example.conf"])
+
+    def test_additional_upperdir_mapping_needs_no_scanner_change(self):
+        extra = self.root / "extra-upper"
+        (extra / "application/file").mkdir(parents=True)
+        (extra / "application/file/config").write_text("changed")
+        module.OVERLAY_UPPERS.append((extra, Path("/opt")))
+        self.assertIn("/opt/application/file/config", module.changed_paths("sysext"))
 
     def test_mutable_confext_uses_separate_volatile_upper(self):
         root = SCRIPT.parents[3]
