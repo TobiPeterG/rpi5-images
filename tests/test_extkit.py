@@ -610,7 +610,7 @@ class ExtensionTest(unittest.TestCase):
     def test_inspect_and_compare_image_contents(self):
         directory = module.store_dir("confext")
         directory.mkdir(parents=True)
-        for version in (1, 2):
+        for version in (1, 2, 3):
             (directory / f"settings_{version}.raw").write_bytes(b"image")
 
         @contextmanager
@@ -638,12 +638,21 @@ class ExtensionTest(unittest.TestCase):
             output = io.StringIO()
             with redirect_stdout(output):
                 module.command_compare(SimpleNamespace(
-                    kind="confext", name="settings", versions=[],
+                    kind="confext", name="settings", versions=["1", "2"],
                 ))
             self.assertIn("settings_1.raw -> settings_2.raw", output.getvalue())
             self.assertIn("-value=old", output.getvalue())
             self.assertIn("+value=new", output.getvalue())
             self.assertIn("ADDED /etc/added.conf", output.getvalue())
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                module.command_compare(SimpleNamespace(
+                    kind="confext", name="settings", versions=["1", "2", "3"],
+                ))
+            comparison = output.getvalue()
+            self.assertIn("settings_1.raw -> settings_2.raw", comparison)
+            self.assertIn("settings_2.raw -> settings_3.raw", comparison)
 
     def test_policy_is_embedded_and_changing_it_rebuilds_the_image(self):
         image = module.store_dir("sysext") / "tools_1.raw"
@@ -662,7 +671,6 @@ class ExtensionTest(unittest.TestCase):
             tree = Path(command[2])
             release = (tree / "usr/lib/extension-release.d/extension-release.tools").read_text()
             self.assertIn("VERSION_ID=20260918", release)
-            self.assertIn("EXTKIT_UPDATE_POLICY=current", release)
             self.assertNotIn("SYSEXT_LEVEL=", release)
             self.assertEqual((tree / "usr/bin/tool").read_text(), "content\n")
             Path(command[1]).write_bytes(b"version-two")
@@ -687,7 +695,6 @@ class ExtensionTest(unittest.TestCase):
             tree = Path(command[2])
             release = (tree / "etc/extension-release.d/extension-release.portable").read_text()
             self.assertIn("ID=_any\n", release)
-            self.assertIn("EXTKIT_UPDATE_POLICY=any\n", release)
             self.assertNotIn("VERSION_ID=", release)
             self.assertNotIn("CONFEXT_LEVEL=", release)
             Path(command[1]).write_bytes(b"any-image")

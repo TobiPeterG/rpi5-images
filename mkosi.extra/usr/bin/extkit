@@ -313,7 +313,6 @@ def release_metadata(tree, name, kind, version, updates):
     metadata += [
         f"IMAGE_ID={name}",
         f"IMAGE_VERSION={version}",
-        f"EXTKIT_UPDATE_POLICY={updates}",
     ]
     location = "usr/lib" if kind == "sysext" else "etc"
     destination = tree / location / "extension-release.d" / f"extension-release.{name}"
@@ -406,13 +405,15 @@ def embedded_update_policy(kind, image):
         metadata = parse_release_file(
             tree / location / "extension-release.d" / f"extension-release.{name}"
         )
-    updates = metadata.get("EXTKIT_UPDATE_POLICY")
-    if updates not in UPDATE_POLICIES:
-        level = "SYSEXT_LEVEL" if kind == "sysext" else "CONFEXT_LEVEL"
-        if metadata.get("ID") == "_any":
-            updates = "any"
-        else:
-            updates = "persistent" if level in metadata else "current"
+    level = "SYSEXT_LEVEL" if kind == "sysext" else "CONFEXT_LEVEL"
+    if metadata.get("ID") == "_any":
+        updates = "any"
+    elif level in metadata:
+        updates = "persistent"
+    elif "VERSION_ID" in metadata:
+        updates = "current"
+    else:
+        fail(f"extension has no systemd compatibility policy: {image}")
     return updates, metadata.get("VERSION_ID")
 
 
@@ -961,15 +962,18 @@ def command_compare(args):
     pairs = []
     for kind in (args.kind,) if args.kind else KINDS:
         versions = image_versions(kind, args.name)
-        if len(args.versions) == 2:
-            old_version, new_version = map(int, args.versions)
-            if old_version in versions and new_version in versions:
-                pairs.append((kind, versions[old_version], versions[new_version]))
+        if args.versions:
+            requested = [int(value) for value in args.versions]
+            if all(version in versions for version in requested):
+                pairs.extend(
+                    (kind, versions[old_version], versions[new_version])
+                    for old_version, new_version in zip(requested, requested[1:])
+                )
         elif len(args.versions) == 0 and len(versions) >= 2:
             newest = sorted(versions)[-2:]
             pairs.append((kind, versions[newest[0]], versions[newest[1]]))
     if not pairs:
-        fail("compare needs two existing versions (or at least two stored versions)")
+        fail("compare needs at least two existing versions")
     for kind, old, new in pairs:
         print(f"{kind}: {old.name} -> {new.name}")
         with image_tree(old) as old_tree, image_tree(new) as new_tree:
@@ -1022,8 +1026,8 @@ def main():
             args.name, args.version = targets[0], None
         else:
             parser.error("enable expects NAME [VERSION] or '*'; disable expects NAME or '*'")
-    if args.command == "compare" and len(args.versions) not in (0, 2):
-        parser.error("compare expects NAME or NAME OLD_VERSION NEW_VERSION")
+    if args.command == "compare" and len(args.versions) == 1:
+        parser.error("compare expects NAME or NAME VERSION VERSION [VERSION ...]")
     if args.command == "activate" and args.kind is None:
         parser.error("activate requires --type")
     try:
