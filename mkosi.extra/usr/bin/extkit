@@ -6,6 +6,7 @@ import configparser
 from contextlib import contextmanager
 import difflib
 import fnmatch
+import glob
 import json
 import os
 import re
@@ -158,7 +159,7 @@ def live_file(relative):
         if parent.is_symlink():
             fail(f"symlinked parent directory is unsupported: {parent}")
     if not path.is_symlink() and not path.is_file():
-        fail(f"live file is missing or unsupported (directories/deletions are not supported): /{relative}")
+        fail(f"live path is missing or has an unsupported file type: /{relative}")
     return path
 
 
@@ -320,12 +321,6 @@ def copy_selected(source, destination):
             shutil.chown(destination, user=source.stat().st_uid, group=source.stat().st_gid)
 
 
-def command_diff(args):
-    with base_tree() as base:
-        for path in args.paths:
-            show_diff(base, relative_path(path, args.kind))
-
-
 def changed_paths(kind=None):
     wanted = set(KINDS[kind]) if kind else {prefix for prefixes in KINDS.values() for prefix in prefixes}
     changed = set()
@@ -349,70 +344,94 @@ def changed_paths(kind=None):
     return sorted(changed)
 
 
-def command_changes(args):
-    for path in changed_paths(args.kind):
-        print(path)
+def staged_paths(kind=None):
+    paths = set(load_selection()) | set(load_deletions())
+    return sorted(path for path in paths
+                  if kind is None or kind_for(relative_path(path)) == kind)
 
 
-def expand_paths(patterns, kind=None):
-    changed = changed_paths(kind) if any(any(char in value for char in "*?[") for value in patterns) else []
+def normalize_shell_glob(patterns):
+    """Recognize an unquoted '*' after the shell expanded it in the current directory."""
+    expanded = glob.glob("*")
+    if patterns and len(patterns) == len(expanded) and set(patterns) == set(expanded):
+        return ["*"]
+    return patterns
+
+
+def select_paths(patterns, candidates, description):
+    patterns = normalize_shell_glob(patterns)
+    if not patterns or patterns == ["*"]:
+        return sorted(candidates)
     selected = set()
     for value in patterns:
-        if any(char in value for char in "*?["):
-            if value != "*" and not value.startswith("/"):
-                fail(f"expected an absolute path pattern or '*': {value}")
-            matches = [path for path in changed if fnmatch.fnmatchcase(path, value)]
-            if not matches:
-                fail(f"no changed files match: {value}")
-            selected.update(matches)
+        if value == "*":
+            selected.update(candidates)
+            continue
+        if value.startswith("/"):
+            pattern = value
+            matches = [path for path in candidates if fnmatch.fnmatchcase(path, pattern)]
         else:
-            selected.add("/" + str(relative_path(value, kind)))
+            # An unquoted shell glob commonly turns '*' into top-level names such
+            # as 'etc' and 'usr'. Treat relative selectors as subtrees, never as
+            # paths to read directly from the running OS.
+            prefix = "/" + value.strip("/")
+            matches = [path for path in candidates
+                       if path == prefix or path.startswith(prefix + "/")]
+        selected.update(matches)
+    if not selected:
+        fail(f"no {description} files match: {' '.join(patterns)}")
     return sorted(selected)
 
 
+def command_diff(args):
+    staged = set(staged_paths(args.kind))
+    show_staged = getattr(args, "staged", False)
+    candidates = staged if show_staged else set(changed_paths(args.kind)) - staged
+    paths = select_paths(args.paths, candidates, "staged" if show_staged else "unstaged")
+    with base_tree() as base:
+        for path in paths:
+            try:
+                show_diff(base, relative_path(path, args.kind))
+            except ValueError as exc:
+                print(f"Skipped {path}: {exc}", file=sys.stderr)
+
+
 def command_stage(args):
-    paths = expand_paths(args.paths, args.kind)
+    paths = select_paths(args.paths, changed_paths(args.kind), "changed")
     deletions = set(load_deletions())
     selection = set(load_selection())
+    staged = 0
+    skipped = []
     for path in paths:
         relative = relative_path(path, args.kind)
         try:
             live_file(relative)
-        except ValueError:
+        except ValueError as exc:
             if not is_whiteout(relative):
-                raise
+                skipped.append((path, exc))
+                continue
             deletions.add(path)
             selection.discard(path)
         else:
             selection.add(path)
             deletions.discard(path)
+        staged += 1
     save_selection(selection)
     save_deletions(deletions)
-    print(f"Staged {len(paths)} path(s); {len(selection) + len(deletions)} total. Content will be read at build time")
+    print(f"Staged {staged} path(s); {len(selection) + len(deletions)} total. Content will be read at build time")
+    for path, exc in skipped:
+        print(f"Skipped {path}: {exc}", file=sys.stderr)
 
 
 def command_unstage(args):
     selection = set(load_selection())
     deletions = set(load_deletions())
-    for path in expand_paths(args.paths, args.kind):
+    for path in select_paths(args.paths, staged_paths(args.kind), "staged"):
         selection.discard(path)
         deletions.discard(path)
     save_selection(selection)
     save_deletions(deletions)
     print(f"{len(selection) + len(deletions)} staged path(s) remain")
-
-
-def command_staged(args):
-    for path in load_selection():
-        relative = relative_path(path)
-        kind = kind_for(relative)
-        if args.kind is None or args.kind == kind:
-            print(f"{kind}\t{path}")
-    for path in load_deletions():
-        relative = relative_path(path)
-        kind = kind_for(relative)
-        if args.kind is None or args.kind == kind:
-            print(f"{kind}\t{path}\tdeleted")
 
 
 def command_status(args):
@@ -493,7 +512,47 @@ def command_list(args):
             print(f"{kind}\t{name}\t{image.name}\t{status}")
 
 
+def version_key(value):
+    return tuple((0, int(part)) if part.isdigit() else (1, part.casefold())
+                 for part in re.split(r"([0-9]+)", value))
+
+
+def split_image_name(image):
+    stem = image.name.removesuffix(".raw")
+    if "_" not in stem:
+        return None
+    return stem.split("_", 1)
+
+
 def command_enable(args):
+    if args.name == "*":
+        if args.version is not None:
+            fail("a version cannot be specified when enabling '*'")
+        candidates = []
+        for kind in (args.kind,) if args.kind else KINDS:
+            newest = {}
+            directory = store_dir(kind)
+            for image in directory.glob("*.raw") if directory.exists() else []:
+                parsed = split_image_name(image)
+                if parsed is None:
+                    continue
+                name, version = parsed
+                current = newest.get(name)
+                if current is None or version_key(version) > version_key(current[0]):
+                    newest[name] = (version, image)
+            for name, (_, image) in sorted(newest.items()):
+                link = enabled_dir(kind) / f"{name}.raw"
+                if not link.exists() and not link.is_symlink():
+                    candidates.append((image, link))
+        if not candidates:
+            fail("no disabled extensions found")
+        for image, link in candidates:
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(image)
+            print(f"Enabled on next boot: {link} -> {image}")
+        return
+    if args.version is None:
+        fail("a version is required when enabling a named extension")
     checked_name(args.name)
     checked_name(args.version)
     candidates = []
@@ -513,6 +572,19 @@ def command_enable(args):
 
 
 def command_disable(args):
+    if args.name == "*":
+        candidates = []
+        for kind in (args.kind,) if args.kind else KINDS:
+            directory = enabled_dir(kind)
+            for link in sorted(directory.glob("*.raw")) if directory.exists() else []:
+                if link.is_symlink() and link.resolve().is_relative_to(store_dir(kind)):
+                    candidates.append((kind, link))
+        if not candidates:
+            fail("no managed enabled extensions found")
+        for kind, link in candidates:
+            link.unlink()
+            print(f"Disabled on next boot: {kind}/{link.stem}")
+        return
     checked_name(args.name)
     candidates = []
     for kind in (args.kind,) if args.kind else KINDS:
@@ -537,17 +609,31 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__, parents=[pre_parser])
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("changes", "status", "diff", "stage", "unstage", "staged", "build", "enable", "disable"):
+    for command in ("status", "diff", "stage", "unstage", "build", "enable", "disable"):
         p = sub.add_parser(command)
         p.add_argument("--type", dest="kind", choices=KINDS)
-        if command in ("build", "enable", "disable"):
+        if command == "build":
             p.add_argument("name")
+        elif command in ("enable", "disable"):
+            p.add_argument("targets", nargs="+")
+        if command == "diff":
+            p.add_argument("--staged", action="store_true")
         if command in ("diff", "stage", "unstage"):
-            p.add_argument("paths", nargs="+")
-        if command in ("build", "enable"):
+            p.add_argument("paths", nargs="*")
+        if command == "build":
             p.add_argument("version")
     sub.add_parser("list").add_argument("--type", dest="kind", choices=KINDS)
     args = parser.parse_args()
+    if args.command in ("enable", "disable"):
+        targets = normalize_shell_glob(args.targets)
+        if targets == ["*"]:
+            args.name, args.version = "*", None
+        elif args.command == "enable" and len(targets) == 2:
+            args.name, args.version = targets
+        elif args.command == "disable" and len(targets) == 1:
+            args.name, args.version = targets[0], None
+        else:
+            parser.error("enable expects NAME VERSION or '*'; disable expects NAME or '*'")
     try:
         globals()[f"command_{args.command}"](args)
     except (ValueError, OSError, subprocess.CalledProcessError, KeyError, configparser.Error) as exc:

@@ -65,6 +65,10 @@ class ExtensionTest(unittest.TestCase):
         (module.ROOT / "usr/bin/example").parent.mkdir(parents=True)
         (module.ROOT / "usr/bin/example").write_text("new executable\n")
         (self.root / "base/etc/example.conf").write_text("old=1\n")
+        for path in ("etc/example.conf", "usr/bin/example"):
+            changed = self.root / "upper" / path
+            changed.parent.mkdir(parents=True, exist_ok=True)
+            changed.write_text("upper copy\n")
 
     def test_diff_and_path_only_staging(self):
         output = io.StringIO()
@@ -85,6 +89,10 @@ class ExtensionTest(unittest.TestCase):
         (Path(module.BASE_DIRECTORY) / "etc/link").symlink_to("old-target")
         (module.ROOT / "etc/same").write_text("same\n")
         (Path(module.BASE_DIRECTORY) / "etc/same").write_text("same\n")
+        for path in ("etc/added.conf", "etc/binary", "etc/link", "etc/same"):
+            changed = self.root / "upper" / path
+            changed.parent.mkdir(parents=True, exist_ok=True)
+            changed.write_text("upper copy\n")
         output = io.StringIO()
         with redirect_stdout(output):
             module.command_diff(SimpleNamespace(
@@ -104,8 +112,8 @@ class ExtensionTest(unittest.TestCase):
         self.assertEqual(len(module.load_selection()), 2)
         output = io.StringIO()
         with redirect_stdout(output):
-            module.command_staged(SimpleNamespace(kind="sysext"))
-        self.assertEqual(output.getvalue(), "sysext\t/usr/bin/example\n")
+            module.command_status(SimpleNamespace(kind="sysext"))
+        self.assertIn("Staged:\n  /usr/bin/example", output.getvalue())
         module.command_unstage(SimpleNamespace(kind=None, paths=["/etc/example.conf"]))
         self.assertEqual(module.load_selection(), ["/usr/bin/example"])
         self.assertEqual((module.ROOT / "etc/example.conf").read_text(), "new=1\n")
@@ -125,6 +133,22 @@ class ExtensionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.command_build(SimpleNamespace(kind=None, name="gone", version="1"))
         self.assertFalse((module.store_dir("confext") / "gone_1.raw").exists())
+
+    def test_stage_skips_unsupported_changed_path_and_stages_the_rest(self):
+        unsupported = self.root / "upper/etc/unsupported"
+        unsupported.write_text("upper entry without a live file")
+        output = io.StringIO()
+        errors = io.StringIO()
+        with redirect_stdout(output), patch("sys.stderr", errors):
+            module.command_diff(SimpleNamespace(kind=None, paths=[], staged=False))
+        self.assertIn("base/etc/example.conf", output.getvalue())
+        self.assertIn("Skipped /etc/unsupported", errors.getvalue())
+
+        errors = io.StringIO()
+        with redirect_stdout(io.StringIO()), patch("sys.stderr", errors):
+            module.command_stage(SimpleNamespace(kind=None, paths=["*"]))
+        self.assertEqual(module.load_selection(), ["/etc/example.conf", "/usr/bin/example"])
+        self.assertIn("Skipped /etc/unsupported", errors.getvalue())
 
     def test_empty_selection_and_index_validation(self):
         self.assertEqual(module.load_selection(), [])
@@ -239,6 +263,7 @@ class ExtensionTest(unittest.TestCase):
         script = module.ROOT / "usr/bin/example"
         script.chmod(0o751)
         (module.ROOT / "etc/example-link").symlink_to("example.conf")
+        (self.root / "upper/etc/example-link").write_text("upper copy\n")
         module.command_stage(SimpleNamespace(kind=None, paths=[
             "/usr/bin/example", "/etc/example-link"
         ]))
@@ -323,39 +348,47 @@ class ExtensionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.command_disable(SimpleNamespace(kind=None, name="test"))
 
-    def test_changes_scans_temp_upperdir_and_filters_type(self):
+    def test_enable_and_disable_all_select_latest_disabled_versions(self):
+        for kind in module.KINDS:
+            directory = module.store_dir(kind)
+            directory.mkdir(parents=True)
+            for version in ("2", "10"):
+                (directory / f"all_{version}.raw").write_bytes(b"image")
+        module.command_enable(SimpleNamespace(kind=None, name="*", version=None))
+        for kind in module.KINDS:
+            link = module.enabled_dir(kind) / "all.raw"
+            self.assertEqual(link.resolve(), module.store_dir(kind) / "all_10.raw")
+        module.command_disable(SimpleNamespace(kind=None, name="*"))
+        for kind in module.KINDS:
+            self.assertFalse((module.enabled_dir(kind) / "all.raw").exists())
+
+    def test_changed_paths_scans_temp_upperdir_and_filters_type(self):
         upper = self.root / "upper"
         for path in ("etc/changed.conf", "usr/bin/tool", "opt/app/file", "var/lib/app/state", "var/log/ignored"):
             target = upper / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("changed")
         result = SimpleNamespace(stdout=f"rw,lowerdir=/base,upperdir={upper},workdir=/work\n")
-        output = io.StringIO()
         with patch.object(module, "ROOT", Path("/")), patch.object(module.subprocess, "run", return_value=result):
-            with redirect_stdout(output):
-                module.command_changes(SimpleNamespace(kind=None))
-        self.assertIn("/etc/changed.conf", output.getvalue())
-        self.assertIn("/usr/bin/tool", output.getvalue())
-        self.assertIn("/opt/app/file", output.getvalue())
-        self.assertIn("/var/lib/app/state", output.getvalue())
-        self.assertNotIn("/var/log/ignored", output.getvalue())
-        output = io.StringIO()
+            changed = module.changed_paths()
+        self.assertIn("/etc/changed.conf", changed)
+        self.assertIn("/usr/bin/tool", changed)
+        self.assertIn("/opt/app/file", changed)
+        self.assertIn("/var/lib/app/state", changed)
+        self.assertNotIn("/var/log/ignored", changed)
         with patch.object(module, "ROOT", Path("/")), patch.object(module.subprocess, "run", return_value=result):
-            with redirect_stdout(output):
-                module.command_changes(SimpleNamespace(kind="confext"))
-        self.assertEqual(output.getvalue(), "/etc/changed.conf\n")
+            confext = module.changed_paths("confext")
+        self.assertIn("/etc/changed.conf", confext)
+        self.assertNotIn("/usr/bin/tool", confext)
 
-    def test_changes_uses_exposed_upper_without_scanning_live_root(self):
+    def test_changed_paths_uses_exposed_upper_without_scanning_live_root(self):
         upper = self.root / "exposed-upper"
         (upper / "etc").mkdir(parents=True)
         (upper / "etc/changed.conf").write_text("changed")
-        output = io.StringIO()
         with patch.object(module, "ROOT", Path("/")), \
              patch.object(module, "OVERLAY_UPPERS", [(upper, Path("/"))]), \
              patch.object(module.subprocess, "run", side_effect=AssertionError("findmnt should not run")):
-            with redirect_stdout(output):
-                module.command_changes(SimpleNamespace(kind=None))
-        self.assertEqual(output.getvalue(), "/etc/changed.conf\n")
+            self.assertEqual(module.changed_paths(), ["/etc/changed.conf"])
 
     def test_status_and_glob_staging(self):
         upper = self.root / "upper"
@@ -382,6 +415,38 @@ class ExtensionTest(unittest.TestCase):
         self.assertEqual(module.load_selection(), ["/usr/bin/example"])
         with self.assertRaises(ValueError):
             module.command_stage(SimpleNamespace(kind=None, paths=["/opt/*"]))
+
+    def test_diff_defaults_to_unstaged_and_can_show_staged(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_diff(SimpleNamespace(kind=None, paths=[], staged=False))
+        self.assertIn("base/etc/example.conf", output.getvalue())
+        self.assertIn("ADDED /usr/bin/example", output.getvalue())
+
+        module.command_stage(SimpleNamespace(kind=None, paths=["/etc/*"]))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_diff(SimpleNamespace(kind=None, paths=[], staged=False))
+        self.assertNotIn("base/etc/example.conf", output.getvalue())
+        self.assertIn("ADDED /usr/bin/example", output.getvalue())
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_diff(SimpleNamespace(kind=None, paths=[], staged=True))
+        self.assertIn("base/etc/example.conf", output.getvalue())
+        self.assertNotIn("/usr/bin/example", output.getvalue())
+
+    def test_stage_and_unstage_without_paths_operate_on_their_sets(self):
+        module.command_stage(SimpleNamespace(kind=None, paths=[]))
+        self.assertEqual(module.load_selection(), ["/etc/example.conf", "/usr/bin/example"])
+        module.command_unstage(SimpleNamespace(kind=None, paths=[]))
+        self.assertEqual(module.load_selection(), [])
+
+    def test_shell_expanded_star_is_recognized(self):
+        expanded = ["bin", "etc", "usr"]
+        with patch.object(module.glob, "glob", return_value=expanded):
+            selected = module.select_paths(expanded, module.changed_paths(), "changed")
+        self.assertEqual(selected, ["/etc/example.conf", "/usr/bin/example"])
 
     def test_confext_upper_changes_are_staged_as_etc_paths(self):
         confext = self.root / "confext-upper"
@@ -460,10 +525,33 @@ class ExtensionTest(unittest.TestCase):
 
         cli("stage", "/etc/example.conf", "/usr/bin/example")
         self.assertEqual(module.load_selection(), ["/etc/example.conf", "/usr/bin/example"])
-        self.assertEqual(cli("staged", "--type", "confext"),
-                         "confext\t/etc/example.conf\n")
+        self.assertIn("Staged:\n  /etc/example.conf", cli("status", "--type", "confext"))
         cli("unstage", "/usr/bin/example")
-        self.assertEqual(cli("staged"), "confext\t/etc/example.conf\n")
+        status = cli("status")
+        self.assertIn("Staged:\n  /etc/example.conf", status)
+        self.assertIn("Unstaged:\n  /usr/bin/example", status)
+
+    def test_cli_accepts_an_unquoted_shell_expanded_star(self):
+        prefix = ["python3", str(SCRIPT), "--config", str(self.config)]
+
+        def shell(command):
+            return subprocess.run(
+                ["bash", "-c", '"$@" ' + command + " *", "bash", *prefix],
+                cwd=self.root, check=True, text=True, capture_output=True,
+            ).stdout
+
+        shell("stage")
+        self.assertEqual(module.load_selection(), ["/etc/example.conf", "/usr/bin/example"])
+        shell("unstage")
+        self.assertEqual(module.load_selection(), [])
+
+        image = module.store_dir("sysext") / "everything_1.raw"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"image")
+        shell("enable")
+        self.assertEqual((module.enabled_dir("sysext") / "everything.raw").resolve(), image)
+        shell("disable")
+        self.assertFalse((module.enabled_dir("sysext") / "everything.raw").exists())
 
     def test_mixed_selection_builds_and_enables_two_images(self):
         module.command_stage(SimpleNamespace(
