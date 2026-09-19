@@ -859,8 +859,8 @@ def command_policy(args):
             print(f"Rebuilt {kind} policy as {args.updates}: {output}")
 
 
-def command_activate(args):
-    """Expose enabled images; systemd applies their embedded compatibility policy."""
+def command_sync(args):
+    """Synchronize enabled images into systemd's runtime discovery directory."""
     kind = args.kind
     destination = runtime_dir(kind)
     if destination.is_symlink():
@@ -992,7 +992,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, parents=[pre_parser])
     sub = parser.add_subparsers(dest="command")
     for command in ("status", "diff", "stage", "unstage", "build", "enable",
-                    "disable", "inspect", "compare", "policy", "activate"):
+                    "disable", "inspect", "compare", "policy", "sync"):
         p = sub.add_parser(command)
         p.add_argument("--type", dest="kind", choices=KINDS)
         if command == "build":
@@ -1032,8 +1032,8 @@ def main():
             parser.error("enable expects NAME [VERSION] or '*'; disable expects NAME or '*'")
     if args.command == "compare" and len(args.versions) == 1:
         parser.error("compare expects NAME or NAME VERSION VERSION [VERSION ...]")
-    if args.command == "activate" and args.kind is None:
-        parser.error("activate requires --type")
+    if args.command == "sync" and args.kind is None:
+        parser.error("sync requires --type")
     try:
         globals()[f"command_{args.command}"](args)
         if show_help_after_status:

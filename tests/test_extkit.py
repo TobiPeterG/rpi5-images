@@ -518,7 +518,7 @@ class ExtensionTest(unittest.TestCase):
         implicit_status = cli()
         self.assertIn("Staged:\n  /etc/example.conf", implicit_status)
         self.assertIn("usage: extkit", implicit_status)
-        self.assertIn("{status,diff,stage,unstage,build,enable,disable,inspect,compare,policy,activate,list}",
+        self.assertIn("{status,diff,stage,unstage,build,enable,disable,inspect,compare,policy,sync,list}",
                       implicit_status)
 
     def test_cli_accepts_an_unquoted_shell_expanded_star(self):
@@ -689,7 +689,7 @@ class ExtensionTest(unittest.TestCase):
         self.assertTrue(image.exists())
         self.assertTrue(newer.exists())
         self.assertEqual((module.enabled_dir("sysext") / "tools.raw").resolve(), newer)
-        module.command_activate(SimpleNamespace(kind="sysext"))
+        module.command_sync(SimpleNamespace(kind="sysext"))
         runtime_link = module.runtime_dir("sysext") / "tools.raw"
         self.assertTrue(runtime_link.is_symlink())
 
