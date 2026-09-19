@@ -10,7 +10,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -42,6 +42,8 @@ class ExtensionTest(unittest.TestCase):
             f"RuntimeDirectory={self.root}\n"
             f"EnabledSysextDirectory={self.root / 'enabled-sysext'}\n"
             f"EnabledConfextDirectory={self.root / 'enabled-confext'}\n"
+            f"RuntimeSysextDirectory={self.root / 'runtime-sysext'}\n"
+            f"RuntimeConfextDirectory={self.root / 'runtime-confext'}\n"
             "[Extensions]\n"
             "Kinds=\n"
             "    sysext /usr /opt /var\n"
@@ -62,7 +64,8 @@ class ExtensionTest(unittest.TestCase):
         (self.root / "base/etc").mkdir(parents=True)
         (module.ROOT / "usr/lib").mkdir(parents=True)
         (module.ROOT / "usr/lib/os-release").write_text(
-            "ID=opensuse-microos\nVERSION_ID=20260918\nSYSEXT_LEVEL=glibc-2.44\n"
+            "ID=opensuse-microos\nVERSION_ID=20260918\nIMAGE_VERSION=37.1\n"
+            "SYSEXT_LEVEL=glibc-2.44\nCONFEXT_LEVEL=microos-confext-1\n"
         )
         (module.ROOT / "etc/example.conf").write_text("new=1\n")
         (module.ROOT / "usr/bin/example").parent.mkdir(parents=True)
@@ -134,7 +137,7 @@ class ExtensionTest(unittest.TestCase):
         module.command_stage(SimpleNamespace(kind=None, paths=["/etc/example.conf"]))
         (module.ROOT / "etc/example.conf").unlink()
         with self.assertRaises(ValueError):
-            module.command_build(SimpleNamespace(kind=None, name="gone", version="1"))
+            module.command_build(SimpleNamespace(kind=None, name="gone"))
         self.assertFalse((module.store_dir("confext") / "gone_1.raw").exists())
 
     def test_stage_skips_unsupported_changed_path_and_stages_the_rest(self):
@@ -167,11 +170,11 @@ class ExtensionTest(unittest.TestCase):
         def fake_erofs(command, check):
             tree = Path(command[2])
             self.assertEqual((tree / "etc/example.conf").read_text(), "later=2\n")
-            self.assertIn("VERSION_ID=20260918", (tree / "etc/extension-release.d/extension-release.local").read_text())
+            self.assertIn("CONFEXT_LEVEL=microos-confext-1", (tree / "etc/extension-release.d/extension-release.local").read_text())
             Path(command[1]).write_bytes(b"test-image")
 
         with patch.object(module.subprocess, "run", side_effect=fake_erofs):
-            module.command_build(SimpleNamespace(kind=None, name="local", version="1"))
+            module.command_build(SimpleNamespace(kind=None, name="local"))
         image = module.store_dir("confext") / "local_1.raw"
         self.assertEqual(image.read_bytes(), b"test-image")
         self.assertEqual(module.load_selection(), [])
@@ -255,11 +258,11 @@ class ExtensionTest(unittest.TestCase):
             else:
                 self.assertEqual(os.readlink(tree / "etc/example-link"), "example.conf")
                 release = (tree / "etc/extension-release.d/extension-release.metadata").read_text()
-                self.assertIn("VERSION_ID=20260918", release)
+                self.assertIn("CONFEXT_LEVEL=microos-confext-1", release)
             Path(command[1]).write_bytes(b"image")
 
         with patch.object(module.subprocess, "run", side_effect=fake_erofs):
-            module.command_build(SimpleNamespace(kind=None, name="metadata", version="1"))
+            module.command_build(SimpleNamespace(kind=None, name="metadata"))
 
     def test_build_type_filter_existing_version_and_failure_cleanup(self):
         module.command_stage(SimpleNamespace(kind=None, paths=[
@@ -270,12 +273,12 @@ class ExtensionTest(unittest.TestCase):
             Path(command[1]).write_bytes(b"image")
 
         with patch.object(module.subprocess, "run", side_effect=fake_erofs):
-            module.command_build(SimpleNamespace(kind="sysext", name="mixed", version="1"))
+            module.command_build(SimpleNamespace(kind="sysext", name="mixed"))
         self.assertTrue((module.store_dir("sysext") / "mixed_1.raw").exists())
         self.assertFalse((module.store_dir("confext") / "mixed_1.raw").exists())
         self.assertEqual(module.load_selection(), ["/etc/example.conf"])
         with self.assertRaises(ValueError):
-            module.command_build(SimpleNamespace(kind="sysext", name="mixed", version="1"))
+            module.command_build(SimpleNamespace(kind="sysext", name="mixed"))
 
         module.command_stage(SimpleNamespace(kind=None, paths=["/usr/bin/example"]))
 
@@ -284,9 +287,11 @@ class ExtensionTest(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, command)
             Path(command[1]).write_bytes(b"image")
 
-        with patch.object(module.subprocess, "run", side_effect=fail_second):
+        with patch.object(module, "embedded_update_policy", return_value=("persistent", None)), \
+             patch.object(module, "copy_image_tree", return_value=None), \
+             patch.object(module.subprocess, "run", side_effect=fail_second):
             with self.assertRaises(subprocess.CalledProcessError):
-                module.command_build(SimpleNamespace(kind=None, name="mixed", version="2"))
+                module.command_build(SimpleNamespace(kind=None, name="mixed"))
         self.assertFalse((module.store_dir("sysext") / "mixed_2.raw").exists())
         self.assertFalse((module.store_dir("confext") / "mixed_2.raw").exists())
 
@@ -318,10 +323,9 @@ class ExtensionTest(unittest.TestCase):
         self.assertIn("confext\ttest\ttest_1.raw\tenabled", output.getvalue())
         self.assertIn("confext\ttest\ttest_2.raw\tdisabled", output.getvalue())
         self.assertNotIn("sysext", output.getvalue())
-        with self.assertRaises(ValueError):
-            module.command_enable(SimpleNamespace(kind=None, name="test", version="2"))
+        module.command_enable(SimpleNamespace(kind=None, name="test", version="2"))
         self.assertEqual((module.enabled_dir("sysext") / "test.raw").resolve(),
-                         module.store_dir("sysext") / "test_1.raw")
+                         module.store_dir("sysext") / "test_2.raw")
         module.command_disable(SimpleNamespace(kind=None, name="test"))
         with self.assertRaises(ValueError):
             module.command_disable(SimpleNamespace(kind=None, name="test"))
@@ -409,12 +413,15 @@ class ExtensionTest(unittest.TestCase):
         with patch.object(
             module, "mounted_extensions",
             side_effect=lambda kind: {"active"} if kind == "sysext" else set(),
+        ), patch.object(
+            module, "embedded_update_policy", return_value=("persistent", None),
         ), redirect_stdout(output):
             module.command_status(SimpleNamespace(kind=None))
 
         status = output.getvalue()
-        self.assertIn("sysext:\n    mounted: active\n    enabled: active_1.raw", status)
-        self.assertIn("confext:\n    mounted: none\n    enabled: none\n    disabled: inactive_2.raw", status)
+        self.assertIn("sysext:\n    mounted: active\n    images:\n      active_1.raw: enabled since", status)
+        self.assertIn("updates: persistent (systemd level compatibility); mounted: yes", status)
+        self.assertIn("confext:\n    mounted: none\n    images:\n      inactive_2.raw: disabled; updates: persistent", status)
 
     def test_diff_defaults_to_unstaged_and_can_show_staged(self):
         output = io.StringIO()
@@ -490,7 +497,7 @@ class ExtensionTest(unittest.TestCase):
             Path(command[1]).write_bytes(b"image")
 
         with patch.object(module.subprocess, "run", side_effect=fake_erofs):
-            module.command_build(SimpleNamespace(kind=None, name="deletion", version="1"))
+            module.command_build(SimpleNamespace(kind=None, name="deletion"))
         self.assertTrue((module.store_dir("sysext") / "deletion_1.raw").is_file())
         self.assertEqual(module.load_deletions(), [])
 
@@ -550,7 +557,7 @@ class ExtensionTest(unittest.TestCase):
             image.write_bytes(b"image")
 
         with patch.object(module.subprocess, "run", side_effect=fake_erofs):
-            module.command_build(SimpleNamespace(kind=None, name="mixed", version="1"))
+            module.command_build(SimpleNamespace(kind=None, name="mixed"))
         self.assertTrue((module.store_dir("sysext") / "mixed_1.raw").is_file())
         self.assertTrue((module.store_dir("confext") / "mixed_1.raw").is_file())
         module.command_enable(SimpleNamespace(kind=None, name="mixed", version="1"))
@@ -560,6 +567,158 @@ class ExtensionTest(unittest.TestCase):
         self.assertFalse((module.enabled_dir("sysext") / "mixed.raw").exists())
         self.assertFalse((module.enabled_dir("confext") / "mixed.raw").exists())
 
+    def test_build_versions_inherits_previous_tree_and_preserves_enable_state(self):
+        module.command_stage(SimpleNamespace(kind="confext", paths=["/etc/example.conf"]))
+
+        def first_erofs(command, check):
+            Path(command[1]).write_bytes(b"version-one")
+
+        with patch.object(module.subprocess, "run", side_effect=first_erofs):
+            module.command_build(SimpleNamespace(kind="confext", name="settings"))
+        first = module.store_dir("confext") / "settings_1.raw"
+        module.command_enable(SimpleNamespace(
+            kind="confext", name="settings", version="1", updates="persistent",
+        ))
+
+        (module.ROOT / "etc/second.conf").write_text("second\n")
+        (self.root / "upper/etc/second.conf").write_text("upper\n")
+        module.command_stage(SimpleNamespace(kind="confext", paths=["/etc/second.conf"]))
+
+        def inherit(image, tree):
+            self.assertEqual(image, first)
+            (tree / "etc").mkdir(parents=True, exist_ok=True)
+            (tree / "etc/from-version-one.conf").write_text("kept\n")
+
+        def second_erofs(command, check):
+            tree = Path(command[2])
+            self.assertEqual((tree / "etc/from-version-one.conf").read_text(), "kept\n")
+            self.assertEqual((tree / "etc/second.conf").read_text(), "second\n")
+            release = tree / "etc/extension-release.d/extension-release.settings"
+            self.assertIn("IMAGE_VERSION=2", release.read_text())
+            Path(command[1]).write_bytes(b"version-two")
+
+        with patch.object(module, "embedded_update_policy", return_value=("persistent", None)), \
+             patch.object(module, "copy_image_tree", side_effect=inherit), \
+             patch.object(module.subprocess, "run", side_effect=second_erofs):
+            module.command_build(SimpleNamespace(kind="confext", name="settings"))
+
+        second = module.store_dir("confext") / "settings_2.raw"
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+        self.assertEqual((module.enabled_dir("confext") / "settings.raw").resolve(), second)
+
+    def test_inspect_and_compare_image_contents(self):
+        directory = module.store_dir("confext")
+        directory.mkdir(parents=True)
+        for version in (1, 2):
+            (directory / f"settings_{version}.raw").write_bytes(b"image")
+
+        @contextmanager
+        def fake_tree(image):
+            with tempfile.TemporaryDirectory() as temporary:
+                tree = Path(temporary)
+                (tree / "etc").mkdir()
+                (tree / "etc/common.conf").write_text(
+                    "value=old\n" if image.name.endswith("_1.raw") else "value=new\n"
+                )
+                if image.name.endswith("_2.raw"):
+                    (tree / "etc/added.conf").write_text("added\n")
+                    (tree / "etc/link").symlink_to("added.conf")
+                yield tree
+
+        with patch.object(module, "image_tree", fake_tree):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                module.command_inspect(SimpleNamespace(
+                    kind="confext", name="settings", version="2",
+                ))
+            self.assertIn("/etc/added.conf", output.getvalue())
+            self.assertIn("/etc/link -> added.conf", output.getvalue())
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                module.command_compare(SimpleNamespace(
+                    kind="confext", name="settings", versions=[],
+                ))
+            self.assertIn("settings_1.raw -> settings_2.raw", output.getvalue())
+            self.assertIn("-value=old", output.getvalue())
+            self.assertIn("+value=new", output.getvalue())
+            self.assertIn("ADDED /etc/added.conf", output.getvalue())
+
+    def test_policy_is_embedded_and_changing_it_rebuilds_the_image(self):
+        image = module.store_dir("sysext") / "tools_1.raw"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"image")
+        module.command_enable(SimpleNamespace(
+            kind="sysext", name="tools", version="1",
+        ))
+
+        def inherit(old, tree):
+            self.assertEqual(old, image)
+            (tree / "usr/bin").mkdir(parents=True)
+            (tree / "usr/bin/tool").write_text("content\n")
+
+        def fake_erofs(command, check):
+            tree = Path(command[2])
+            release = (tree / "usr/lib/extension-release.d/extension-release.tools").read_text()
+            self.assertIn("VERSION_ID=20260918", release)
+            self.assertIn("EXTKIT_UPDATE_POLICY=current", release)
+            self.assertNotIn("SYSEXT_LEVEL=", release)
+            self.assertEqual((tree / "usr/bin/tool").read_text(), "content\n")
+            Path(command[1]).write_bytes(b"version-two")
+
+        with patch.object(module, "copy_image_tree", side_effect=inherit), \
+             patch.object(module.subprocess, "run", side_effect=fake_erofs):
+            module.command_policy(SimpleNamespace(
+                kind="sysext", name="tools", updates="current",
+            ))
+        newer = module.store_dir("sysext") / "tools_2.raw"
+        self.assertTrue(image.exists())
+        self.assertTrue(newer.exists())
+        self.assertEqual((module.enabled_dir("sysext") / "tools.raw").resolve(), newer)
+        module.command_activate(SimpleNamespace(kind="sysext"))
+        runtime_link = module.runtime_dir("sysext") / "tools.raw"
+        self.assertTrue(runtime_link.is_symlink())
+
+    def test_any_policy_uses_systemd_id_any_without_version_constraints(self):
+        module.command_stage(SimpleNamespace(kind="confext", paths=["/etc/example.conf"]))
+
+        def fake_erofs(command, check):
+            tree = Path(command[2])
+            release = (tree / "etc/extension-release.d/extension-release.portable").read_text()
+            self.assertIn("ID=_any\n", release)
+            self.assertIn("EXTKIT_UPDATE_POLICY=any\n", release)
+            self.assertNotIn("VERSION_ID=", release)
+            self.assertNotIn("CONFEXT_LEVEL=", release)
+            Path(command[1]).write_bytes(b"any-image")
+
+        with patch.object(module.subprocess, "run", side_effect=fake_erofs):
+            module.command_build(SimpleNamespace(
+                kind="confext", name="portable", updates="any",
+            ))
+
+        self.assertEqual(
+            (module.store_dir("confext") / "portable_1.raw").read_bytes(),
+            b"any-image",
+        )
+
+    def test_status_shows_policy_and_enable_timestamp(self):
+        image = module.store_dir("confext") / "settings_1.raw"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"image")
+        module.command_enable(SimpleNamespace(
+            kind="confext", name="settings", version="1", updates="current",
+        ))
+        output = io.StringIO()
+        with patch.object(
+            module, "embedded_update_policy", return_value=("current", "20260918")
+        ), redirect_stdout(output):
+            module.command_status(SimpleNamespace(kind="confext"))
+        status = output.getvalue()
+        self.assertIn("enabled since ", status)
+        self.assertIn("updates: current VERSION_ID 20260918", status)
+        self.assertIn("mounted: no", status)
+
     def test_real_erofs_image_when_tools_are_available(self):
         tools = SCRIPT.parents[3] / "mkosi.tools/usr/sbin"
         mkfs = shutil.which("mkfs.erofs") or str(tools / "mkfs.erofs")
@@ -567,16 +726,36 @@ class ExtensionTest(unittest.TestCase):
         if not Path(mkfs).is_file() or not Path(fsck).is_file():
             self.skipTest("erofs-utils is not available")
         module.EROFS_TOOL = mkfs
+        module.EROFS_FSCK_TOOL = fsck
         module.command_stage(SimpleNamespace(
             kind=None, paths=["/etc/example.conf", "/usr/bin/example"]
         ))
-        module.command_build(SimpleNamespace(kind=None, name="local", version="1"))
+        module.command_build(SimpleNamespace(kind=None, name="local"))
         images = {kind: module.store_dir(kind) / "local_1.raw" for kind in module.KINDS}
         dissect = shutil.which("systemd-dissect")
         for image in images.values():
             subprocess.run([fsck, str(image)], check=True, capture_output=True)
             if dissect:
                 subprocess.run([dissect, "--validate", str(image)], check=True, capture_output=True)
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_inspect(SimpleNamespace(
+                kind="confext", name="local", version="1",
+            ))
+        self.assertIn("/etc/example.conf", output.getvalue())
+        (module.ROOT / "etc/inherited-build.conf").write_text("second version\n")
+        (self.root / "upper/etc/inherited-build.conf").write_text("upper copy\n")
+        module.command_stage(SimpleNamespace(
+            kind="confext", paths=["/etc/inherited-build.conf"],
+        ))
+        module.command_build(SimpleNamespace(kind="confext", name="local"))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_inspect(SimpleNamespace(
+                kind="confext", name="local", version="2",
+            ))
+        self.assertIn("/etc/example.conf", output.getvalue())
+        self.assertIn("/etc/inherited-build.conf", output.getvalue())
         for kind, command in (("confext", "systemd-confext"), ("sysext", "systemd-sysext")):
             tool = shutil.which(command)
             if not tool:
@@ -589,6 +768,29 @@ class ExtensionTest(unittest.TestCase):
                 check=True, text=True, capture_output=True,
             )
             self.assertIn("local", result.stdout)
+
+        confext = shutil.which("systemd-confext")
+        if confext:
+            (module.ROOT / "etc/current-only.conf").write_text("current version only\n")
+            (self.root / "upper/etc/current-only.conf").write_text("upper copy\n")
+            module.command_stage(SimpleNamespace(
+                kind="confext", paths=["/etc/current-only.conf"],
+            ))
+            module.command_build(SimpleNamespace(
+                kind="confext", name="current-only", updates="current",
+            ))
+            current = module.store_dir("confext") / "current-only_1.raw"
+            installed = module.ROOT / "var/lib/confexts"
+            shutil.copyfile(current, installed / "current-only.raw")
+            result = subprocess.run(
+                [confext, f"--root={module.ROOT}", "list", "--no-pager"],
+                check=True, text=True, capture_output=True,
+            )
+            self.assertIn("current-only", result.stdout)
+            self.assertEqual(
+                module.embedded_update_policy("confext", current),
+                ("current", "20260918"),
+            )
 
 
 if __name__ == "__main__":

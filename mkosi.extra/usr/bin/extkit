@@ -4,6 +4,7 @@
 import argparse
 import configparser
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import difflib
 import fnmatch
 import glob
@@ -26,15 +27,19 @@ BASE_FSTYPE = None
 OVERLAY_UPPERS = []
 RUNTIME_DIRECTORY = None
 ENABLED_DIRS = {}
+RUNTIME_DIRS = {}
 EROFS_TOOL = None
+EROFS_FSCK_TOOL = None
 KINDS = {}
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 EXCLUDED_TREES = ()
+UPDATE_POLICIES = ("persistent", "current", "any")
 
 
 def configure(path):
     global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPERS
-    global RUNTIME_DIRECTORY, ENABLED_DIRS, EROFS_TOOL, KINDS, EXCLUDED_TREES
+    global RUNTIME_DIRECTORY, ENABLED_DIRS, RUNTIME_DIRS, EROFS_TOOL, EROFS_FSCK_TOOL
+    global KINDS, EXCLUDED_TREES
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path):
         fail(f"configuration file not found: {path}")
@@ -61,6 +66,10 @@ def configure(path):
     ENABLED_DIRS = {
         "sysext": Path(paths["EnabledSysextDirectory"]),
         "confext": Path(paths["EnabledConfextDirectory"]),
+    }
+    RUNTIME_DIRS = {
+        "sysext": Path(paths.get("RuntimeSysextDirectory", "/run/extensions")),
+        "confext": Path(paths.get("RuntimeConfextDirectory", "/run/confexts")),
     }
     extensions = config["Extensions"]
     KINDS = {}
@@ -101,8 +110,10 @@ def configure(path):
         excluded.append(relative.parts)
     EXCLUDED_TREES = tuple(excluded)
     EROFS_TOOL = config["Build"]["ErofsTool"]
+    EROFS_FSCK_TOOL = config["Build"].get("ErofsFsckTool", "fsck.erofs")
     for name, value in (("StateDirectory", STATE), ("RootDirectory", ROOT),
-                        ("RuntimeDirectory", RUNTIME_DIRECTORY), *ENABLED_DIRS.items()):
+                        ("RuntimeDirectory", RUNTIME_DIRECTORY),
+                        *ENABLED_DIRS.items(), *RUNTIME_DIRS.items()):
         if not value.is_absolute():
             fail(f"{name} must be an absolute path: {value}")
     if not BASE_DIRECTORY and not BASE_DEVICE:
@@ -286,15 +297,24 @@ def os_release():
     return result
 
 
-def release_metadata(tree, name, kind, version):
+def release_metadata(tree, name, kind, version, updates):
     release = os_release()
     level = "SYSEXT_LEVEL" if kind == "sysext" else "CONFEXT_LEVEL"
-    metadata = [f"ID={release['ID']}"]
-    if release.get(level):
-        metadata.append(f"{level}={release[level]}")
+    if updates == "any":
+        metadata = ["ID=_any"]
+    elif updates == "persistent":
+        if not release.get(level):
+            fail(f"{level} is required for persistent {kind} images")
+        metadata = [f"ID={release['ID']}", f"{level}={release[level]}"]
     else:
-        metadata.append(f"VERSION_ID={release['VERSION_ID']}")
-    metadata += [f"IMAGE_ID={name}", f"IMAGE_VERSION={version}"]
+        if not release.get("VERSION_ID"):
+            fail(f"VERSION_ID is required for current-system {kind} images")
+        metadata = [f"ID={release['ID']}", f"VERSION_ID={release['VERSION_ID']}"]
+    metadata += [
+        f"IMAGE_ID={name}",
+        f"IMAGE_VERSION={version}",
+        f"EXTKIT_UPDATE_POLICY={updates}",
+    ]
     location = "usr/lib" if kind == "sysext" else "etc"
     destination = tree / location / "extension-release.d" / f"extension-release.{name}"
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -309,7 +329,110 @@ def enabled_dir(kind):
     return ENABLED_DIRS[kind]
 
 
+def runtime_dir(kind):
+    return RUNTIME_DIRS[kind]
+
+
+def image_versions(kind, name):
+    versions = {}
+    directory = store_dir(kind)
+    for image in directory.glob(f"{name}_*.raw") if directory.exists() else []:
+        parsed = split_image_name(image)
+        if parsed is None or parsed[0] != name:
+            continue
+        version = parsed[1]
+        if not version.isdecimal() or int(version) < 1:
+            fail(f"automatic versioning requires positive integer versions: {image}")
+        versions[int(version)] = image
+    return versions
+
+
+def latest_image(kind, name):
+    versions = image_versions(kind, name)
+    return versions[max(versions)] if versions else None
+
+
+def requested_images(name, version=None, kind=None):
+    checked_name(name)
+    if version is not None:
+        checked_name(version)
+    found = []
+    for candidate_kind in (kind,) if kind else KINDS:
+        image = (store_dir(candidate_kind) / f"{name}_{version}.raw"
+                 if version is not None else latest_image(candidate_kind, name))
+        if image is not None and image.is_file():
+            found.append((candidate_kind, image))
+    if not found:
+        suffix = f" version {version}" if version is not None else ""
+        fail(f"no built images found for {name}{suffix}")
+    return found
+
+
+@contextmanager
+def image_tree(image):
+    """Extract an image into a private temporary tree for inspection or inheritance."""
+    RUNTIME_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="extkit-image-", dir=RUNTIME_DIRECTORY) as directory:
+        tree = Path(directory) / "tree"
+        tree.mkdir()
+        subprocess.run([
+            EROFS_FSCK_TOOL, f"--extract={tree}", "--overwrite", "--preserve",
+            str(image),
+        ], check=True)
+        yield tree
+
+
+def copy_image_tree(image, destination):
+    with image_tree(image) as source:
+        subprocess.run(["cp", "-a", f"{source}/.", str(destination)], check=True)
+
+
+def parse_release_file(path):
+    values = {}
+    for line in path.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            values[key] = value.strip().strip('"')
+    return values
+
+
+def embedded_update_policy(kind, image):
+    parsed = split_image_name(image)
+    if parsed is None:
+        fail(f"invalid extension image name: {image}")
+    name, _ = parsed
+    location = "usr/lib" if kind == "sysext" else "etc"
+    with image_tree(image) as tree:
+        metadata = parse_release_file(
+            tree / location / "extension-release.d" / f"extension-release.{name}"
+        )
+    updates = metadata.get("EXTKIT_UPDATE_POLICY")
+    if updates not in UPDATE_POLICIES:
+        level = "SYSEXT_LEVEL" if kind == "sysext" else "CONFEXT_LEVEL"
+        if metadata.get("ID") == "_any":
+            updates = "any"
+        else:
+            updates = "persistent" if level in metadata else "current"
+    return updates, metadata.get("VERSION_ID")
+
+
+def policy_description(updates, version_id=None):
+    if updates == "persistent":
+        return "persistent (systemd level compatibility)"
+    if updates == "any":
+        return "any system (ID=_any)"
+    return f"current VERSION_ID {version_id or 'unknown'}"
+
+
+def remove_path(path):
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
 def copy_selected(source, destination):
+    remove_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source.is_symlink():
         destination.symlink_to(os.readlink(source))
@@ -464,8 +587,7 @@ def mounted_extensions(kind):
 
 
 def stored_extension_states(kind):
-    enabled = []
-    disabled = []
+    states = []
     directory = store_dir(kind)
     for image in sorted(directory.glob("*.raw")) if directory.exists() else []:
         parsed = split_image_name(image)
@@ -473,9 +595,14 @@ def stored_extension_states(kind):
             continue
         name, _ = parsed
         link = enabled_dir(kind) / f"{name}.raw"
-        target = enabled if link.is_symlink() and link.resolve() == image.resolve() else disabled
-        target.append(image.name)
-    return enabled, disabled
+        selected = link.is_symlink() and link.resolve() == image.resolve()
+        states.append((image, selected, link if selected else None))
+    return states
+
+
+def enabled_since(link):
+    timestamp = link.lstat().st_mtime
+    return datetime.fromtimestamp(timestamp, timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def command_status(args):
@@ -494,17 +621,31 @@ def command_status(args):
         if args.kind is not None and kind != args.kind:
             continue
         mounted = mounted_extensions(kind)
-        enabled, disabled = stored_extension_states(kind)
         mounted_text = "unknown" if mounted is None else ", ".join(sorted(mounted)) or "none"
         print(f"  {kind}:")
         print(f"    mounted: {mounted_text}")
-        print(f"    enabled: {', '.join(enabled) if enabled else 'none'}")
-        print(f"    disabled: {', '.join(disabled) if disabled else 'none'}")
+        states = stored_extension_states(kind)
+        if not states:
+            print("    images: none")
+            continue
+        print("    images:")
+        for image, selected, link in states:
+            name, _ = split_image_name(image)
+            updates, version_id = embedded_update_policy(kind, image)
+            policy = policy_description(updates, version_id)
+            if selected:
+                mounted_now = mounted is not None and name in mounted
+                print(
+                    f"      {image.name}: enabled since {enabled_since(link)}; "
+                    f"updates: {policy}; "
+                    f"mounted: {'yes' if mounted_now else 'no'}"
+                )
+            else:
+                print(f"      {image.name}: disabled; updates: {policy}")
 
 
 def command_build(args):
     checked_name(args.name)
-    checked_name(args.version)
     selection = load_selection()
     deletions = load_deletions()
     if not selection and not deletions:
@@ -521,13 +662,28 @@ def command_build(args):
         kind = kind_for(relative)
         if args.kind is None or args.kind == kind:
             grouped_deletions[kind].append(relative)
-    outputs = {kind: store_dir(kind) / f"{args.name}_{args.version}.raw"
+    existing = {
+        kind: image_versions(kind, args.name)
+        for kind in KINDS
+    }
+    version = 1 + max(
+        (number for versions in existing.values() for number in versions),
+        default=0,
+    )
+    outputs = {kind: store_dir(kind) / f"{args.name}_{version}.raw"
                for kind in KINDS if grouped[kind] or grouped_deletions[kind]}
     if not outputs:
         fail(f"selection has no {args.kind} paths")
-    for output in outputs.values():
-        if output.exists():
-            fail(f"image already exists: {output}")
+    previously_enabled = {}
+    update_policies = {}
+    for kind in outputs:
+        link = enabled_dir(kind) / f"{args.name}.raw"
+        previously_enabled[kind] = (
+            link.is_symlink() and link.resolve().is_relative_to(store_dir(kind))
+        )
+        previous = existing[kind].get(max(existing[kind])) if existing[kind] else None
+        inherited = embedded_update_policy(kind, previous)[0] if previous else "persistent"
+        update_policies[kind] = getattr(args, "updates", None) or inherited
     workdir = STATE / "work"
     workdir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="extkit-", dir=workdir) as work:
@@ -535,20 +691,29 @@ def command_build(args):
         for kind, output in outputs.items():
             tree = Path(work) / kind / "tree"
             tree.mkdir(parents=True)
+            if existing[kind]:
+                copy_image_tree(existing[kind][max(existing[kind])], tree)
             for relative in grouped[kind]:
                 copy_selected(live_file(relative), tree / relative)
             for relative in grouped_deletions[kind]:
                 whiteout = tree / relative
+                remove_path(whiteout)
                 whiteout.parent.mkdir(parents=True, exist_ok=True)
                 os.mknod(whiteout, stat.S_IFCHR, os.makedev(0, 0))
-            release_metadata(tree, args.name, kind, args.version)
+            release_metadata(tree, args.name, kind, str(version), update_policies[kind])
             draft = Path(work) / f"{kind}.raw"
             subprocess.run([EROFS_TOOL, str(draft), str(tree)], check=True)
             drafts[kind] = draft
         for kind, output in outputs.items():
             output.parent.mkdir(parents=True, exist_ok=True)
             drafts[kind].replace(output)
-            print(f"Built unsigned, disabled {kind} image: {output}")
+        for kind, output in outputs.items():
+            if previously_enabled[kind]:
+                enable_image(kind, args.name, output)
+                state = "enabled"
+            else:
+                state = "disabled"
+            print(f"Built unsigned {state} {kind} image: {output}")
     built = {"/" + str(path) for paths in grouped.values() for path in paths}
     built_deletions = {"/" + str(path) for paths in grouped_deletions.values() for path in paths}
     save_selection(set(selection) - built)
@@ -561,7 +726,10 @@ def command_list(args):
             continue
         directory = store_dir(kind)
         for image in sorted(directory.glob("*.raw")) if directory.exists() else []:
-            name = image.name.split("_", 1)[0]
+            parsed = split_image_name(image)
+            if parsed is None:
+                continue
+            name, _ = parsed
             link = enabled_dir(kind) / f"{name}.raw"
             status = "enabled" if link.is_symlink() and link.resolve() == image.resolve() else "disabled"
             print(f"{kind}\t{name}\t{image.name}\t{status}")
@@ -577,6 +745,16 @@ def split_image_name(image):
     if "_" not in stem:
         return None
     return stem.split("_", 1)
+
+
+def enable_image(kind, name, image):
+    link = enabled_dir(kind) / f"{name}.raw"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    temporary = link.with_name(f".{link.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)
+    temporary.symlink_to(image)
+    temporary.replace(link)
+    return link
 
 
 def command_enable(args):
@@ -598,31 +776,17 @@ def command_enable(args):
             for name, (_, image) in sorted(newest.items()):
                 link = enabled_dir(kind) / f"{name}.raw"
                 if not link.exists() and not link.is_symlink():
-                    candidates.append((image, link))
+                    candidates.append((kind, name, image))
         if not candidates:
             fail("no disabled extensions found")
-        for image, link in candidates:
-            link.parent.mkdir(parents=True, exist_ok=True)
-            link.symlink_to(image)
+        for kind, name, image in candidates:
+            link = enable_image(kind, name, image)
             print(f"Enabled on next boot: {link} -> {image}")
         return
-    if args.version is None:
-        fail("a version is required when enabling a named extension")
     checked_name(args.name)
-    checked_name(args.version)
-    candidates = []
-    for kind in (args.kind,) if args.kind else KINDS:
-        image = store_dir(kind) / f"{args.name}_{args.version}.raw"
-        if image.is_file():
-            link = enabled_dir(kind) / f"{args.name}.raw"
-            if link.exists() or link.is_symlink():
-                fail(f"already enabled or occupied: {link}; disable it first")
-            candidates.append((image, link))
-    if not candidates:
-        fail(f"no built images found for {args.name} version {args.version}")
-    for image, link in candidates:
-        link.parent.mkdir(parents=True, exist_ok=True)
-        link.symlink_to(image)
+    candidates = requested_images(args.name, args.version, args.kind)
+    for kind, image in candidates:
+        link = enable_image(kind, args.name, image)
         print(f"Enabled on next boot: {link} -> {image}")
 
 
@@ -653,6 +817,165 @@ def command_disable(args):
         print(f"Disabled on next boot: {kind}/{args.name}")
 
 
+def command_policy(args):
+    checked_name(args.name)
+    all_existing = {
+        kind: image_versions(kind, args.name)
+        for kind in KINDS
+    }
+    existing = {
+        kind: image_versions(kind, args.name)
+        for kind in ((args.kind,) if args.kind else KINDS)
+    }
+    existing = {kind: versions for kind, versions in existing.items() if versions}
+    if not existing:
+        fail(f"no built images found for {args.name}")
+    version = 1 + max(number for versions in all_existing.values() for number in versions)
+    workdir = STATE / "work"
+    workdir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="extkit-policy-", dir=workdir) as work:
+        drafts = {}
+        enabled = {}
+        for kind, versions in existing.items():
+            previous = versions[max(versions)]
+            tree = Path(work) / kind / "tree"
+            tree.mkdir(parents=True)
+            copy_image_tree(previous, tree)
+            release_metadata(tree, args.name, kind, str(version), args.updates)
+            draft = Path(work) / f"{kind}.raw"
+            subprocess.run([EROFS_TOOL, str(draft), str(tree)], check=True)
+            drafts[kind] = draft
+            link = enabled_dir(kind) / f"{args.name}.raw"
+            enabled[kind] = (
+                link.is_symlink() and link.resolve().is_relative_to(store_dir(kind))
+            )
+        for kind, draft in drafts.items():
+            output = store_dir(kind) / f"{args.name}_{version}.raw"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            draft.replace(output)
+            if enabled[kind]:
+                enable_image(kind, args.name, output)
+            print(f"Rebuilt {kind} policy as {args.updates}: {output}")
+
+
+def command_activate(args):
+    """Expose enabled images; systemd applies their embedded compatibility policy."""
+    kind = args.kind
+    destination = runtime_dir(kind)
+    if destination.is_symlink():
+        destination.unlink()
+    destination.mkdir(parents=True, exist_ok=True)
+    for entry in destination.iterdir():
+        if entry.is_symlink() or entry.is_file():
+            entry.unlink()
+        elif entry.is_dir():
+            fail(f"runtime extension directory contains unmanaged directory: {entry}")
+    source = enabled_dir(kind)
+    for link in sorted(source.glob("*.raw")) if source.exists() else []:
+        if not link.is_symlink() or not link.resolve().is_relative_to(store_dir(kind)):
+            continue
+        (destination / link.name).symlink_to(link)
+
+
+def describe_entry(path, relative):
+    info = path.lstat()
+    mode = stat.filemode(info.st_mode)
+    if path.is_symlink():
+        return f"l {mode} /{relative} -> {os.readlink(path)}"
+    if stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(0, 0):
+        return f"w {mode} /{relative} (deletion whiteout)"
+    if path.is_file():
+        return f"f {mode} {info.st_size:>9} /{relative}"
+    return f"? {mode} /{relative}"
+
+
+def image_entries(tree):
+    entries = {}
+    for directory, names, files in os.walk(tree, followlinks=False):
+        directory = Path(directory)
+        for name in names + files:
+            path = directory / name
+            if path.is_dir() and not path.is_symlink():
+                continue
+            relative = path.relative_to(tree)
+            entries[str(relative)] = path
+    return entries
+
+
+def command_inspect(args):
+    for kind, image in requested_images(args.name, args.version, args.kind):
+        print(f"{kind} {image.name}:")
+        with image_tree(image) as tree:
+            for relative, path in sorted(image_entries(tree).items()):
+                print(f"  {describe_entry(path, relative)}")
+
+
+def show_image_difference(old_tree, new_tree, old_label, new_label):
+    old_entries = image_entries(old_tree)
+    new_entries = image_entries(new_tree)
+    for relative in sorted(set(old_entries) | set(new_entries)):
+        old = old_entries.get(relative)
+        new = new_entries.get(relative)
+        if old is None:
+            print(f"ADDED /{relative}")
+            continue
+        if new is None:
+            print(f"REMOVED /{relative}")
+            continue
+        old_info, new_info = old.lstat(), new.lstat()
+        if old.is_symlink() or new.is_symlink():
+            old_value = os.readlink(old) if old.is_symlink() else "<not a symlink>"
+            new_value = os.readlink(new) if new.is_symlink() else "<not a symlink>"
+            if old_value != new_value:
+                print(f"CHANGED /{relative}: {old_value!r} -> {new_value!r}")
+            continue
+        old_whiteout = stat.S_ISCHR(old_info.st_mode) and old_info.st_rdev == os.makedev(0, 0)
+        new_whiteout = stat.S_ISCHR(new_info.st_mode) and new_info.st_rdev == os.makedev(0, 0)
+        if old_whiteout or new_whiteout:
+            if old_whiteout != new_whiteout:
+                print(f"CHANGED /{relative}: {'deleted' if old_whiteout else 'present'} -> "
+                      f"{'deleted' if new_whiteout else 'present'}")
+            continue
+        if not old.is_file() or not new.is_file():
+            if stat.S_IFMT(old_info.st_mode) != stat.S_IFMT(new_info.st_mode):
+                print(f"TYPE CHANGED /{relative}")
+            continue
+        old_bytes, new_bytes = old.read_bytes(), new.read_bytes()
+        if old_bytes == new_bytes and stat.S_IMODE(old_info.st_mode) == stat.S_IMODE(new_info.st_mode):
+            continue
+        if b"\0" in old_bytes or b"\0" in new_bytes:
+            print(f"BINARY CHANGED /{relative}: {len(old_bytes)} -> {len(new_bytes)} bytes")
+        else:
+            before = old_bytes.decode("utf-8", "replace").splitlines(keepends=True)
+            after = new_bytes.decode("utf-8", "replace").splitlines(keepends=True)
+            sys.stdout.writelines(difflib.unified_diff(
+                before, after,
+                fromfile=f"{old_label}/{relative}", tofile=f"{new_label}/{relative}",
+            ))
+        if stat.S_IMODE(old_info.st_mode) != stat.S_IMODE(new_info.st_mode):
+            print(f"MODE /{relative}: {stat.filemode(old_info.st_mode)} -> {stat.filemode(new_info.st_mode)}")
+
+
+def command_compare(args):
+    checked_name(args.name)
+    pairs = []
+    for kind in (args.kind,) if args.kind else KINDS:
+        versions = image_versions(kind, args.name)
+        if len(args.versions) == 2:
+            old_version, new_version = map(int, args.versions)
+            if old_version in versions and new_version in versions:
+                pairs.append((kind, versions[old_version], versions[new_version]))
+        elif len(args.versions) == 0 and len(versions) >= 2:
+            newest = sorted(versions)[-2:]
+            pairs.append((kind, versions[newest[0]], versions[newest[1]]))
+    if not pairs:
+        fail("compare needs two existing versions (or at least two stored versions)")
+    for kind, old, new in pairs:
+        print(f"{kind}: {old.name} -> {new.name}")
+        with image_tree(old) as old_tree, image_tree(new) as new_tree:
+            show_image_difference(old_tree, new_tree, old.name, new.name)
+
+
 def main():
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=Path, default=Path("/etc/extkit.conf"))
@@ -664,31 +987,45 @@ def main():
 
     parser = argparse.ArgumentParser(description=__doc__, parents=[pre_parser])
     sub = parser.add_subparsers(dest="command", required=True)
-    for command in ("status", "diff", "stage", "unstage", "build", "enable", "disable"):
+    for command in ("status", "diff", "stage", "unstage", "build", "enable",
+                    "disable", "inspect", "compare", "policy", "activate"):
         p = sub.add_parser(command)
         p.add_argument("--type", dest="kind", choices=KINDS)
         if command == "build":
             p.add_argument("name")
         elif command in ("enable", "disable"):
             p.add_argument("targets", nargs="+")
+        elif command == "inspect":
+            p.add_argument("name")
+            p.add_argument("version", nargs="?")
+        elif command == "compare":
+            p.add_argument("name")
+            p.add_argument("versions", nargs="*")
+        elif command == "policy":
+            p.add_argument("name")
+            p.add_argument("updates", choices=UPDATE_POLICIES)
         if command == "diff":
             p.add_argument("--staged", action="store_true")
         if command in ("diff", "stage", "unstage"):
             p.add_argument("paths", nargs="*")
         if command == "build":
-            p.add_argument("version")
+            p.add_argument("--updates", choices=UPDATE_POLICIES)
     sub.add_parser("list").add_argument("--type", dest="kind", choices=KINDS)
     args = parser.parse_args()
     if args.command in ("enable", "disable"):
         targets = normalize_shell_glob(args.targets)
         if targets == ["*"]:
             args.name, args.version = "*", None
-        elif args.command == "enable" and len(targets) == 2:
-            args.name, args.version = targets
+        elif args.command == "enable" and len(targets) in (1, 2):
+            args.name, args.version = targets[0], targets[1] if len(targets) == 2 else None
         elif args.command == "disable" and len(targets) == 1:
             args.name, args.version = targets[0], None
         else:
-            parser.error("enable expects NAME VERSION or '*'; disable expects NAME or '*'")
+            parser.error("enable expects NAME [VERSION] or '*'; disable expects NAME or '*'")
+    if args.command == "compare" and len(args.versions) not in (0, 2):
+        parser.error("compare expects NAME or NAME OLD_VERSION NEW_VERSION")
+    if args.command == "activate" and args.kind is None:
+        parser.error("activate requires --type")
     try:
         globals()[f"command_{args.command}"](args)
     except (ValueError, OSError, subprocess.CalledProcessError, KeyError, configparser.Error) as exc:
