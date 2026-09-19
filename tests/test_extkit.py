@@ -54,6 +54,9 @@ class ExtensionTest(unittest.TestCase):
             "[Build]\nErofsTool=mkfs.erofs\n"
         )
         module.configure(config)
+        mounted_patcher = patch.object(module, "mounted_extensions", return_value=set())
+        mounted_patcher.start()
+        self.addCleanup(mounted_patcher.stop)
         (self.root / "upper").mkdir()
         (module.ROOT / "etc").mkdir(parents=True)
         (self.root / "base/etc").mkdir(parents=True)
@@ -390,6 +393,28 @@ class ExtensionTest(unittest.TestCase):
         self.assertEqual(module.load_selection(), ["/usr/bin/example"])
         with self.assertRaises(ValueError):
             module.command_stage(SimpleNamespace(kind=None, paths=["/opt/*"]))
+
+    def test_status_reports_mounted_enabled_and_disabled_extensions(self):
+        sysext = module.store_dir("sysext") / "active_1.raw"
+        confext = module.store_dir("confext") / "inactive_2.raw"
+        sysext.parent.mkdir(parents=True)
+        confext.parent.mkdir(parents=True)
+        sysext.write_bytes(b"image")
+        confext.write_bytes(b"image")
+        module.command_enable(SimpleNamespace(
+            kind="sysext", name="active", version="1"
+        ))
+
+        output = io.StringIO()
+        with patch.object(
+            module, "mounted_extensions",
+            side_effect=lambda kind: {"active"} if kind == "sysext" else set(),
+        ), redirect_stdout(output):
+            module.command_status(SimpleNamespace(kind=None))
+
+        status = output.getvalue()
+        self.assertIn("sysext:\n    mounted: active\n    enabled: active_1.raw", status)
+        self.assertIn("confext:\n    mounted: none\n    enabled: none\n    disabled: inactive_2.raw", status)
 
     def test_diff_defaults_to_unstaged_and_can_show_staged(self):
         output = io.StringIO()

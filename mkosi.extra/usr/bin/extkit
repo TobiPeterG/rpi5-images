@@ -434,6 +434,50 @@ def command_unstage(args):
     print(f"{len(selection) + len(deletions)} staged path(s) remain")
 
 
+def mounted_extensions(kind):
+    environment = os.environ.copy()
+    environment[f"SYSTEMD_{kind.upper()}_HIERARCHIES"] = ":".join(
+        f"/{prefix}" for prefix in KINDS[kind]
+    )
+    try:
+        result = subprocess.run(
+            [f"systemd-{kind}", "status", "--json=short", "--no-pager"],
+            text=True, capture_output=True, env=environment,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    mounted = set()
+    for row in rows:
+        values = row.get("extensions", [])
+        if isinstance(values, str):
+            values = re.split(r"[\s,]+", values)
+        for value in values:
+            if value and value != "none":
+                mounted.add(value)
+    return mounted
+
+
+def stored_extension_states(kind):
+    enabled = []
+    disabled = []
+    directory = store_dir(kind)
+    for image in sorted(directory.glob("*.raw")) if directory.exists() else []:
+        parsed = split_image_name(image)
+        if parsed is None:
+            continue
+        name, _ = parsed
+        link = enabled_dir(kind) / f"{name}.raw"
+        target = enabled if link.is_symlink() and link.resolve() == image.resolve() else disabled
+        target.append(image.name)
+    return enabled, disabled
+
+
 def command_status(args):
     selection = set(load_selection())
     deletions = set(load_deletions())
@@ -445,6 +489,17 @@ def command_status(args):
     print("Unstaged:")
     for path in sorted(changed - selection - deletions):
         print(f"  {path}")
+    print("Extensions:")
+    for kind in KINDS:
+        if args.kind is not None and kind != args.kind:
+            continue
+        mounted = mounted_extensions(kind)
+        enabled, disabled = stored_extension_states(kind)
+        mounted_text = "unknown" if mounted is None else ", ".join(sorted(mounted)) or "none"
+        print(f"  {kind}:")
+        print(f"    mounted: {mounted_text}")
+        print(f"    enabled: {', '.join(enabled) if enabled else 'none'}")
+        print(f"    disabled: {', '.join(disabled) if disabled else 'none'}")
 
 
 def command_build(args):
