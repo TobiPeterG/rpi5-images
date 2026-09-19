@@ -990,7 +990,7 @@ def main():
         pre_parser.error(str(exc))
 
     parser = argparse.ArgumentParser(description=__doc__, parents=[pre_parser])
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
     for command in ("status", "diff", "stage", "unstage", "build", "enable",
                     "disable", "inspect", "compare", "policy", "activate"):
         p = sub.add_parser(command)
@@ -1016,6 +1016,10 @@ def main():
             p.add_argument("--updates", choices=UPDATE_POLICIES)
     sub.add_parser("list").add_argument("--type", dest="kind", choices=KINDS)
     args = parser.parse_args()
+    show_help_after_status = args.command is None
+    if show_help_after_status:
+        args.command = "status"
+        args.kind = None
     if args.command in ("enable", "disable"):
         targets = normalize_shell_glob(args.targets)
         if targets == ["*"]:
@@ -1032,6 +1036,9 @@ def main():
         parser.error("activate requires --type")
     try:
         globals()[f"command_{args.command}"](args)
+        if show_help_after_status:
+            print()
+            parser.print_help()
     except (ValueError, OSError, subprocess.CalledProcessError, KeyError, configparser.Error) as exc:
         parser.exit(1, f"extkit: {exc}\n")
 

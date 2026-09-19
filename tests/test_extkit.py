@@ -515,6 +515,11 @@ class ExtensionTest(unittest.TestCase):
         status = cli("status")
         self.assertIn("Staged:\n  /etc/example.conf", status)
         self.assertIn("Unstaged:\n  /usr/bin/example", status)
+        implicit_status = cli()
+        self.assertIn("Staged:\n  /etc/example.conf", implicit_status)
+        self.assertIn("usage: extkit", implicit_status)
+        self.assertIn("{status,diff,stage,unstage,build,enable,disable,inspect,compare,policy,activate,list}",
+                      implicit_status)
 
     def test_cli_accepts_an_unquoted_shell_expanded_star(self):
         prefix = ["python3", str(SCRIPT), "--config", str(self.config)]
