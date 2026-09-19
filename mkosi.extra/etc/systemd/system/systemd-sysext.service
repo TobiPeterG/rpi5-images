@@ -1,0 +1,31 @@
+[Unit]
+Description=Merge System Extension Images into /usr/, /opt/, and /var/
+Documentation=man:systemd-sysext.service(8)
+
+ConditionCapability=CAP_SYS_ADMIN
+ConditionDirectoryNotEmpty=|/.state/extensions
+ConditionPathExists=!/etc/initrd-release
+ConditionKernelCommandLine=!systemd.sysext=0
+
+# The vendor unit starts after local-fs.target. This image must merge /var
+# first, so that the persistent /var/log bind mount is attached to the merged
+# hierarchy instead of being hidden below it.
+DefaultDependencies=no
+RequiresMountsFor=/.state
+Before=var-log.mount local-fs.target sysinit.target systemd-tmpfiles-setup.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=+/usr/bin/install -d -m 0700 /run/extensions.mutable
+ExecStartPre=+/usr/bin/ln -sfn /.state/extensions /run/extensions
+Environment=SYSTEMD_SYSEXT_HIERARCHIES=/usr:/opt:/var
+Environment=SYSTEMD_SYSEXT_MUTABLE_MODE=yes
+ExecStart=systemd-sysext refresh
+ExecReload=systemd-sysext refresh
+ExecStop=systemd-sysext unmerge
+
+[Install]
+WantedBy=sysinit.target
