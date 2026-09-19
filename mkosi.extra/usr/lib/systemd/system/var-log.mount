@@ -1,0 +1,13 @@
+[Unit]
+Description=Persistent system logs
+RequiresMountsFor=/.state
+After=systemd-sysext.service
+
+[Mount]
+What=/.state/var-log
+Where=/var/log
+Type=none
+Options=bind,rw,nodev,nosuid,noexec
+
+[Install]
+WantedBy=local-fs.target

@@ -42,6 +42,15 @@ class ExtensionTest(unittest.TestCase):
             f"RuntimeDirectory={self.root}\n"
             f"EnabledSysextDirectory={self.root / 'enabled-sysext'}\n"
             f"EnabledConfextDirectory={self.root / 'enabled-confext'}\n"
+            "[Extensions]\n"
+            "Kinds=\n"
+            "    sysext /usr /opt /var\n"
+            "    confext /etc\n"
+            "ExcludedTrees=\n"
+            "    /var/log\n"
+            "    /var/lib/extensions\n"
+            "    /var/lib/confexts\n"
+            "    /var/lib/extensions.mutable\n"
             "[Build]\nErofsTool=mkfs.erofs\n"
         )
         module.configure(config)
@@ -152,10 +161,24 @@ class ExtensionTest(unittest.TestCase):
         self.assertEqual(module.STATE, Path("/.state/extkit"))
         self.assertEqual(module.OVERLAY_UPPERS, [
             (Path("/.overlay/upper"), Path("/")),
-            (Path("/var/lib/extensions.mutable/etc"), Path("/etc")),
+            (Path("/run/extensions.mutable/etc"), Path("/etc")),
+            (Path("/run/extensions.mutable/usr"), Path("/usr")),
+            (Path("/run/extensions.mutable/opt"), Path("/opt")),
+            (Path("/run/extensions.mutable/var"), Path("/var")),
         ])
         self.assertEqual(module.BASE_DEVICE, Path("/dev/mapper/root"))
-        self.assertEqual(module.enabled_dir("confext"), Path("/var/lib/confexts"))
+        self.assertEqual(module.KINDS, {
+            "sysext": ("usr", "opt", "var"),
+            "confext": ("etc",),
+        })
+        self.assertEqual(module.EXCLUDED_TREES, (
+            ("var", "log"),
+            ("var", "lib", "extensions"),
+            ("var", "lib", "confexts"),
+            ("var", "lib", "extensions.mutable"),
+        ))
+        self.assertEqual(module.enabled_dir("sysext"), Path("/.state/extensions"))
+        self.assertEqual(module.enabled_dir("confext"), Path("/.state/confexts"))
 
     def test_invalid_configuration(self):
         with self.assertRaises(ValueError):
@@ -166,6 +189,50 @@ class ExtensionTest(unittest.TestCase):
         ))
         with self.assertRaises(ValueError):
             module.configure(bad)
+        module.configure(self.config)
+
+    def test_configurable_kinds_and_excluded_trees(self):
+        custom = self.root / "custom.conf"
+        custom.write_text(self.config.read_text().replace(
+            "    sysext /usr /opt /var\n"
+            "    confext /etc\n",
+            "    sysext /usr /srv\n"
+            "    confext /etc /opt\n",
+        ).replace(
+            "    /var/log\n"
+            "    /var/lib/extensions\n"
+            "    /var/lib/confexts\n"
+            "    /var/lib/extensions.mutable\n",
+            "    /var/cache/private\n"
+            "    /etc/private\n"
+            "    /usr/share/private\n",
+        ))
+        module.configure(custom)
+        self.assertEqual(module.KINDS, {
+            "sysext": ("usr", "srv"),
+            "confext": ("etc", "opt"),
+        })
+        self.assertEqual(module.kind_for(Path("srv/application/file")), "sysext")
+        self.assertEqual(module.kind_for(Path("opt/application.conf")), "confext")
+        self.assertTrue(module.excluded_path(Path("var/cache/private/secret")))
+        self.assertTrue(module.excluded_path(Path("etc/private/secret.conf")))
+        self.assertTrue(module.excluded_path(Path("usr/share/private/data")))
+        self.assertFalse(module.excluded_path(Path("var/log/messages")))
+
+    def test_invalid_extension_configuration(self):
+        replacements = (
+            ("    sysext /usr /opt /var\n    confext /etc\n", ""),
+            ("    sysext /usr /opt /var\n", "    unknown /usr\n"),
+            ("    confext /etc\n", "    confext relative\n"),
+            ("    confext /etc\n", "    confext /usr\n"),
+            ("    /var/log\n", "    relative/private\n"),
+        )
+        for old, new in replacements:
+            with self.subTest(replacement=new):
+                bad = self.root / f"bad-extension-{len(new)}-{abs(hash(new))}.conf"
+                bad.write_text(self.config.read_text().replace(old, new))
+                with self.assertRaises(ValueError):
+                    module.configure(bad)
         module.configure(self.config)
 
     def test_copy_preserves_mode_symlink_and_release_level(self):
@@ -258,7 +325,7 @@ class ExtensionTest(unittest.TestCase):
 
     def test_changes_scans_temp_upperdir_and_filters_type(self):
         upper = self.root / "upper"
-        for path in ("etc/changed.conf", "usr/bin/tool", "opt/app/file", "var/log/ignored"):
+        for path in ("etc/changed.conf", "usr/bin/tool", "opt/app/file", "var/lib/app/state", "var/log/ignored"):
             target = upper / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text("changed")
@@ -270,6 +337,7 @@ class ExtensionTest(unittest.TestCase):
         self.assertIn("/etc/changed.conf", output.getvalue())
         self.assertIn("/usr/bin/tool", output.getvalue())
         self.assertIn("/opt/app/file", output.getvalue())
+        self.assertIn("/var/lib/app/state", output.getvalue())
         self.assertNotIn("/var/log/ignored", output.getvalue())
         output = io.StringIO()
         with patch.object(module, "ROOT", Path("/")), patch.object(module.subprocess, "run", return_value=result):
@@ -333,10 +401,47 @@ class ExtensionTest(unittest.TestCase):
     def test_mutable_confext_uses_separate_volatile_upper(self):
         root = SCRIPT.parents[3]
         unit = root / "mkosi.extra/usr/lib/systemd/system/systemd-confext.service.d/10-volatile-writes.conf"
-        mount = root / "mkosi.extra/usr/lib/systemd/system/var-lib-extensions.mutable.mount"
         self.assertIn("SYSTEMD_CONFEXT_MUTABLE_MODE=enabled", unit.read_text())
-        self.assertIn("What=tmpfs", mount.read_text())
-        self.assertIn("Where=/var/lib/extensions.mutable", mount.read_text())
+        self.assertIn("/run/extensions.mutable", unit.read_text())
+
+    def test_sysext_supports_var_with_volatile_writes(self):
+        root = SCRIPT.parents[3]
+        unit = root / "mkosi.extra/usr/lib/systemd/system/systemd-sysext.service.d/10-var-and-volatile-writes.conf"
+        contents = unit.read_text()
+        self.assertIn("SYSTEMD_SYSEXT_HIERARCHIES=/usr:/opt:/var", contents)
+        self.assertIn("SYSTEMD_SYSEXT_MUTABLE_MODE=enabled", contents)
+        self.assertEqual(module.kind_for(Path("var/lib/example")), "sysext")
+
+    def test_deleted_var_file_builds_erofs_whiteout(self):
+        relative = Path("var/lib/YaST2/reconfig_system")
+        base = Path(module.BASE_DIRECTORY) / relative
+        base.parent.mkdir(parents=True)
+        base.touch()
+        whiteout = self.root / "upper" / relative
+        whiteout.parent.mkdir(parents=True)
+        try:
+            os.mknod(whiteout, stat.S_IFCHR, os.makedev(0, 0))
+        except PermissionError:
+            self.skipTest("creating an OverlayFS whiteout requires CAP_MKNOD")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            module.command_diff(SimpleNamespace(kind=None, paths=[f"/{relative}"]))
+        self.assertEqual(output.getvalue(), f"DELETED /{relative}\n")
+        module.command_stage(SimpleNamespace(kind=None, paths=[f"/{relative}"]))
+        self.assertEqual(module.load_deletions(), [f"/{relative}"])
+
+        def fake_erofs(command, check):
+            built_whiteout = Path(command[2]) / relative
+            info = built_whiteout.lstat()
+            self.assertTrue(stat.S_ISCHR(info.st_mode))
+            self.assertEqual(info.st_rdev, os.makedev(0, 0))
+            Path(command[1]).write_bytes(b"image")
+
+        with patch.object(module.subprocess, "run", side_effect=fake_erofs):
+            module.command_build(SimpleNamespace(kind=None, name="firstboot-done", version="1"))
+        self.assertTrue((module.store_dir("sysext") / "firstboot-done_1.raw").is_file())
+        self.assertEqual(module.load_deletions(), [])
 
     def test_initrd_upper_hook_is_present_and_valid_shell(self):
         root = SCRIPT.parents[3]
