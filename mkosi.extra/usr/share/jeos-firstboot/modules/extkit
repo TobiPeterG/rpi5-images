@@ -1,0 +1,21 @@
+# shellcheck shell=bash
+# Run after JeOS network configuration using its supported module hooks.
+extkit_title="Phone signing"
+extkit_description="Set up a phone to authorize system extensions"
+extkit_priority=100
+
+extkit_post() {
+    if /usr/bin/extkit-phone check-enrollment --quiet; then
+        return 0
+    fi
+    # The pairing client uses the wizard's terminal for code confirmation.
+    clear || true
+    /usr/bin/extkit-phone setup || {
+        printf '\nPhone setup was not completed. Run extkit-phone setup after login.\n'
+        return 0
+    }
+}
+
+extkit_jeos_config() {
+    /usr/bin/extkit-phone setup
+}

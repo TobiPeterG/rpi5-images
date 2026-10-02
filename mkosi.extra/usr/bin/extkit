@@ -1002,8 +1002,20 @@ def command_boot_check(args):
         fail("mutable extension data must be backed by /run, not persistent storage")
 
 
+def warn_if_signing_key_unenrolled():
+    try:
+        subprocess.run([PHONE_TOOL, "check-enrollment"], check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print("WARNING: User signing key enrollment could not be confirmed. "
+             "Continuing extension creation, but boot-time verification will reject "
+             "images signed by an untrusted key. Run 'extkit-phone setup' and reboot. "
+             "If boot.img is already personalized, reboot to load its key. "
+             f"({error})", file=sys.stderr)
+
+
 def command_build(args):
     checked_name(args.name)
+    warn_if_signing_key_unenrolled()
     selection = load_selection()
     deletions = load_deletions()
     if not selection and not deletions:
@@ -1184,6 +1196,7 @@ def command_disable(args):
 
 def command_policy(args):
     checked_name(args.name)
+    warn_if_signing_key_unenrolled()
     all_existing = {
         kind: image_versions(kind, args.name)
         for kind in KINDS
@@ -1420,7 +1433,7 @@ def main():
     if args.command in ("sync", "boot-check") and args.kind is None:
         parser.error(f"{args.command} requires --type")
     try:
-        globals()[f"command_{args.command}"](args)
+        globals()[f"command_{args.command.replace('-', '_')}"](args)
         if show_help_after_status:
             print()
             parser.print_help()

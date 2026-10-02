@@ -27,6 +27,7 @@ BINDING_DOMAIN = b"org.extkit.transport-binding.v1\n"
 PAIRING_DOMAIN = b"org.extkit.pairing.v1\0"
 EFI_CERT_X509_GUID = uuid.UUID("a5c059a1-94e4-4aa7-87b5-ab155c2bf072")
 MAX_HEADER = 64 * 1024
+PENDING_ENROLLMENT = Path("/run/extkit-phone/pending-enrollment")
 
 
 class ExtKitPhoneError(RuntimeError):
@@ -436,6 +437,96 @@ def command_discover(config):
     return 0 if phones else 1
 
 
+def has_enrolled_user_key(config):
+    return bool(enrolled_certificates(config["db_glob"], config["extension_owner"]))
+
+
+def enrollment_instructions(config):
+    image = config["boot_directory"] / "boot.img"
+    return (
+        "No ExtKit user signing key is enrolled in the live Secure Boot db.\n"
+        "On your phone, open ExtSigner and enable local-network receiving.\n"
+        "Connect both devices to the same local network, then run as root:\n"
+        f"  extkit-phone send {image} --kind boot\n"
+        "Compare the six-digit code on both devices and authorize signing.\n"
+        "Then reboot the Pi and run: extkit-phone check-enrollment\n"
+        "If you already personalized boot.img, reboot to load its key.\n"
+        "This procedure does not write OTP or change EEPROM configuration."
+    )
+
+
+def command_check_enrollment(config, quiet=False):
+    if has_enrolled_user_key(config):
+        if not quiet:
+            print("ExtKit user signing key is enrolled in the live Secure Boot db.")
+        return 0
+    if not quiet:
+        print(enrollment_instructions(config), file=sys.stderr)
+    return 1
+
+
+def record_pending_enrollment(phone):
+    directory = PENDING_ENROLLMENT.parent
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory.is_symlink() or directory.stat().st_uid != os.geteuid():
+        fail("unsafe pending-enrollment directory")
+    if directory.stat().st_mode & 0o077:
+        fail("pending-enrollment directory must be private")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=directory,
+                                     prefix=".pending-", delete=False) as temporary:
+        temporary.write(phone.extension_fingerprint + "\n")
+        temporary_path = Path(temporary.name)
+    try:
+        temporary_path.replace(PENDING_ENROLLMENT)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def pending_key_needs_reboot(config):
+    try:
+        fingerprint = PENDING_ENROLLMENT.read_text("ascii").strip()
+    except (OSError, UnicodeError):
+        return False
+    if len(fingerprint) != 64 or any(char not in "0123456789abcdef" for char in fingerprint):
+        return False
+    live = {hashlib.sha256(cert).hexdigest() for cert in
+            enrolled_certificates(config["db_glob"], config["extension_owner"])}
+    return fingerprint not in live
+
+
+def command_setup(config):
+    if pending_key_needs_reboot(config):
+        print("Signed boot files were installed during this boot, but the phone's key "
+              "is not in the live Secure Boot db yet. Reboot to activate the key; "
+              "pairing does not need to be repeated.")
+        return 0
+    if has_enrolled_user_key(config):
+        print("Phone signing is already provisioned: an ExtKit user key is active "
+              "in the live Secure Boot db. Skipping pairing.")
+        return 0
+    print("\nSet up your phone as an extension signer\n")
+    print(enrollment_instructions(config))
+    while True:
+        answer = input("\nSet up phone signing now? [Y/n] ").strip().lower()
+        if answer not in {"", "y", "yes"}:
+            print("Skipped. Extensions signed by this phone will not be trusted at boot "
+                  "until enrollment and reboot.")
+            return 0
+        try:
+            subprocess.run(["systemctl", "start", "avahi-daemon.service"], check=True)
+            command_send(argparse.Namespace(
+                input=str(config["boot_directory"] / "boot.img"),
+                kind="boot", output=None,
+            ), config)
+        except (ExtKitPhoneError, OSError, ValueError, KeyError,
+                subprocess.CalledProcessError) as error:
+            print(f"Phone setup did not complete: {error}", file=sys.stderr)
+            continue
+        print("\nSigned boot files installed. Reboot after firstboot finishes to load "
+              "your signing key and allow its extensions to pass boot-time verification.")
+        return 0
+
+
 def command_send(args, config):
     phones, errors = find_phones(config)
     enrolled = [phone for phone in phones if phone.enrolled]
@@ -452,6 +543,12 @@ def command_send(args, config):
     if kind == "auto":
         kind = "extension" if str(args.input).endswith(".extsign") else "boot"
     send_request(phone, token, args.input, kind, args.output, config)
+    if kind == "boot" and args.output is None:
+        try:
+            record_pending_enrollment(phone)
+        except (OSError, ExtKitPhoneError) as error:
+            print(f"Could not save the reboot reminder: {error}. "
+                  "Reboot to activate the installed signing key.", file=sys.stderr)
     return 0
 
 
@@ -460,13 +557,22 @@ def main(argv=None):
     parser.add_argument("--config", default="/etc/extkit-phone.conf")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("discover", help="list visible signers and Secure Boot enrollment status")
+    enrollment = commands.add_parser("check-enrollment", help="check for a user key in the live Secure Boot db")
+    enrollment.add_argument("--quiet", action="store_true")
+    commands.add_parser("setup", help="set up phone signing if no user key is enrolled")
     send = commands.add_parser("send", help="send an extension request or boot.img for on-phone review")
     send.add_argument("input")
     send.add_argument("--kind", choices=("auto", "extension", "boot"), default="auto")
     send.add_argument("--output", help="finished GPT image path for extensions; save boot files here instead of installing them on the boot partition")
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    return command_discover(config) if args.command == "discover" else command_send(args, config)
+    if args.command == "discover":
+        return command_discover(config)
+    if args.command == "check-enrollment":
+        return command_check_enrollment(config, args.quiet)
+    if args.command == "setup":
+        return command_setup(config)
+    return command_send(args, config)
 
 
 if __name__ == "__main__":
