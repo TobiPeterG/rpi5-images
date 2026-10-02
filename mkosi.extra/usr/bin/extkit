@@ -2,20 +2,28 @@
 """Inspect live changes and build systemd extensions."""
 
 import argparse
+import base64
 import configparser
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import difflib
 import fnmatch
 import glob
+import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
+import zipfile
+import uuid
+import zlib
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -30,16 +38,22 @@ ENABLED_DIRS = {}
 RUNTIME_DIRS = {}
 EROFS_TOOL = None
 EROFS_FSCK_TOOL = None
+PHONE_SIGNING = True
+PHONE_TOOL = None
+REPART_TOOL = None
 KINDS = {}
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 EXCLUDED_TREES = ()
 UPDATE_POLICIES = ("persistent", "current", "any")
+BLOCK_SIZE = 4096
+DIGEST_SIZE = 32
+HASHES_PER_BLOCK = BLOCK_SIZE // DIGEST_SIZE
 
 
 def configure(path):
     global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPERS
     global RUNTIME_DIRECTORY, ENABLED_DIRS, RUNTIME_DIRS, EROFS_TOOL, EROFS_FSCK_TOOL
-    global KINDS, EXCLUDED_TREES
+    global KINDS, EXCLUDED_TREES, PHONE_SIGNING, PHONE_TOOL, REPART_TOOL
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path):
         fail(f"configuration file not found: {path}")
@@ -111,6 +125,9 @@ def configure(path):
     EXCLUDED_TREES = tuple(excluded)
     EROFS_TOOL = config["Build"]["ErofsTool"]
     EROFS_FSCK_TOOL = config["Build"].get("ErofsFsckTool", "fsck.erofs")
+    PHONE_SIGNING = config["Build"].getboolean("PhoneSigning", fallback=True)
+    PHONE_TOOL = config["Build"].get("PhoneTool", "/usr/bin/extkit-phone")
+    REPART_TOOL = config["Build"].get("RepartTool", "systemd-repart")
     for name, value in (("StateDirectory", STATE), ("RootDirectory", ROOT),
                         ("RuntimeDirectory", RUNTIME_DIRECTORY),
                         *ENABLED_DIRS.items(), *RUNTIME_DIRS.items()):
@@ -374,9 +391,16 @@ def image_tree(image):
     with tempfile.TemporaryDirectory(prefix="extkit-image-", dir=RUNTIME_DIRECTORY) as directory:
         tree = Path(directory) / "tree"
         tree.mkdir()
+        filesystem = image
+        partitions = gpt_partitions(image)
+        if partitions is not None:
+            if "extkit-root" not in partitions:
+                fail("no ExtKit filesystem partition in image")
+            filesystem = Path(directory) / "extension.erofs"
+            copy_partition(image, partitions["extkit-root"], filesystem)
         subprocess.run([
             EROFS_FSCK_TOOL, f"--extract={tree}", "--overwrite", "--preserve",
-            str(image),
+            str(filesystem),
         ], check=True)
         yield tree
 
@@ -645,6 +669,339 @@ def command_status(args):
                 print(f"      {image.name}: disabled; updates: {policy}")
 
 
+def hash_block(block, salt):
+    return hashlib.sha256(salt + block).digest()
+
+
+def verity_root_hash(image, data_blocks, salt, temporary_directory):
+    """Compute the cryptsetup-compatible dm-verity v1/SHA-256 root hash."""
+    image = Path(image)
+    if image.stat().st_size != data_blocks * BLOCK_SIZE:
+        raise ValueError("image size does not equal data_blocks * 4096")
+    source, source_blocks, generated = image, data_blocks, []
+    try:
+        while source_blocks > 1:
+            output_blocks = (source_blocks + HASHES_PER_BLOCK - 1) // HASHES_PER_BLOCK
+            descriptor, filename = tempfile.mkstemp(prefix="verity-level-", dir=temporary_directory)
+            os.close(descriptor)
+            output = Path(filename)
+            generated.append(output)
+            with source.open("rb") as src, output.open("wb") as dst:
+                remaining = source_blocks
+                for _ in range(output_blocks):
+                    hashes = bytearray(BLOCK_SIZE)
+                    for index in range(HASHES_PER_BLOCK):
+                        if not remaining:
+                            break
+                        block = src.read(BLOCK_SIZE)
+                        if len(block) != BLOCK_SIZE:
+                            raise ValueError("truncated image while calculating dm-verity")
+                        start = index * DIGEST_SIZE
+                        hashes[start:start + DIGEST_SIZE] = hash_block(block, salt)
+                        remaining -= 1
+                    dst.write(hashes)
+                if remaining or src.read(1):
+                    raise ValueError("image size changed while calculating dm-verity")
+            source, source_blocks = output, output_blocks
+        with source.open("rb") as src:
+            block = src.read(BLOCK_SIZE)
+            if len(block) != BLOCK_SIZE or src.read(1):
+                raise ValueError("invalid final dm-verity level")
+        return hash_block(block, salt).hex()
+    finally:
+        for path in generated:
+            path.unlink(missing_ok=True)
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def json_bytes(value):
+    return (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode()
+
+
+SIGNED_POLICY = "root=signed:usr=absent"
+SIGNATURE_BYTES = 16384
+
+
+def gpt_partitions(image):
+    """Read our 512-byte-sector GPT, checking bounds and CRCs before extraction."""
+    with Path(image).open("rb") as stream:
+        stream.seek(512)
+        header = bytearray(stream.read(512))
+        if header[:8] != b"EFI PART":
+            return None
+        header_size = struct.unpack_from("<I", header, 12)[0]
+        if not 92 <= header_size <= 512:
+            fail("invalid GPT header size")
+        expected = struct.unpack_from("<I", header, 16)[0]
+        struct.pack_into("<I", header, 16, 0)
+        if zlib.crc32(header[:header_size]) != expected:
+            fail("invalid GPT header checksum")
+        entry_lba, count, size, checksum = struct.unpack_from("<QIII", header, 72)
+        image_size = Path(image).stat().st_size
+        if not 1 <= count <= 128 or size != 128 or entry_lba < 2:
+            fail("unsupported GPT entry table")
+        if entry_lba * 512 + count * size > image_size:
+            fail("GPT entry table outside image")
+        stream.seek(entry_lba * 512)
+        entries = stream.read(count * size)
+        if zlib.crc32(entries) != checksum:
+            fail("invalid GPT partition table checksum")
+        partitions = {}
+        extents = []
+        for index in range(count):
+            entry = entries[index * size:(index + 1) * size]
+            if entry[:16] == bytes(16):
+                continue
+            start, end = struct.unpack_from("<QQ", entry, 32)
+            if start < 34 or end < start or (end + 1) * 512 > image_size:
+                fail("GPT partition outside image")
+            if any(start <= other_end and end >= other_start
+                   for other_start, other_end in extents):
+                fail("overlapping GPT partitions")
+            extents.append((start, end))
+            label = entry[56:128].decode("utf-16-le").rstrip("\0")
+            if label in partitions:
+                fail("duplicate GPT partition label")
+            partitions[label] = {
+                "offset": start * 512, "size": (end - start + 1) * 512,
+                "uuid": uuid.UUID(bytes_le=entry[16:32]).hex,
+            }
+        return partitions
+
+
+def copy_partition(image, partition, output):
+    with Path(image).open("rb") as source, Path(output).open("wb") as target:
+        source.seek(partition["offset"])
+        remaining = partition["size"]
+        while remaining:
+            chunk = source.read(min(remaining, 1024 * 1024))
+            if not chunk:
+                fail("truncated partition")
+            target.write(chunk)
+            remaining -= len(chunk)
+
+
+def ddi_request(image, request, name, version, kind):
+    """Request a signature over the pre-built DDI filesystem and hash."""
+    partitions = gpt_partitions(image)
+    if partitions is None or not all(label in partitions for label in
+                                     ("extkit-root", "extkit-verity", "extkit-signature")):
+        fail("expected an ExtKit GPT image with filesystem, verity and signature partitions")
+    with Path(image).open("rb") as source:
+        source.seek(partitions["extkit-verity"]["offset"])
+        header = source.read(512)
+    fields = struct.unpack_from("<8sII16s32sIIQH6x256s", header)
+    magic, version_format, hash_type, _, algorithm, data_size, hash_size, blocks, salt_size, salt = fields
+    if (magic != b"verity\0\0" or version_format != 1 or hash_type != 1 or
+            algorithm.rstrip(b"\0") != b"sha256" or data_size != 4096 or
+            hash_size != 4096 or not 1 <= salt_size <= 256):
+        fail("unsupported verity superblock")
+    if blocks * 4096 != partitions["extkit-root"]["size"]:
+        fail("verity data size differs from filesystem partition size")
+    with tempfile.TemporaryDirectory(prefix="extkit-request-") as work:
+        filesystem = Path(work) / "extension.erofs"
+        copy_partition(image, partitions["extkit-root"], filesystem)
+        root_hash = verity_root_hash(filesystem, blocks, salt[:salt_size], work)
+    expected = partitions["extkit-root"]["uuid"] + partitions["extkit-verity"]["uuid"]
+    if root_hash != expected:
+        fail("pre-built DDI root hash differs from signing request")
+    metadata = json_bytes({
+        "format": "org.extkit.signing-request.v3", "name": name,
+        "version": str(version), "kind": kind, "imageEntry": "extension.raw",
+        "imageSha256": file_sha256(image), "rootHash": root_hash,
+    })
+    request = Path(request)
+    request.parent.mkdir(parents=True, exist_ok=True)
+    temporary_request = request.with_suffix(request.suffix + ".tmp")
+    try:
+        with zipfile.ZipFile(temporary_request, "w", allowZip64=True) as archive:
+            archive.writestr("request.json", metadata, compress_type=zipfile.ZIP_DEFLATED)
+            archive.write(image, "extension.raw", compress_type=zipfile.ZIP_STORED)
+        temporary_request.replace(request)
+    finally:
+        temporary_request.unlink(missing_ok=True)
+    return root_hash
+
+
+def prepare_ddi(filesystem, output, request, name, version, kind):
+    """Let systemd-repart build GPT and verity; reserve space for offline signing."""
+    filesystem = Path(filesystem).resolve()
+    data_size = filesystem.stat().st_size
+    if not data_size or data_size % 4096:
+        fail("EROFS size must be a non-zero multiple of 4096")
+    with tempfile.TemporaryDirectory(prefix="extkit-repart-") as work:
+        definitions = Path(work)
+        # CopyBlocks takes a literal absolute path; reject config metacharacters.
+        if any(character in str(filesystem) for character in ('%', '\\', '\n', '\r')):
+            fail("unsupported characters in filesystem image path")
+        (definitions / "10-root.conf").write_text(
+            '[Partition]\nType=root\nLabel=extkit-root\n'
+            f'CopyBlocks={filesystem}\nSizeMinBytes={data_size}\nSizeMaxBytes={data_size}\n'
+            'ReadOnly=yes\nVerity=data\nVerityMatchKey=root\n'
+        )
+        (definitions / "20-verity.conf").write_text(
+            '[Partition]\nType=root-verity\nLabel=extkit-verity\n'
+            'ReadOnly=yes\nVerity=hash\nVerityMatchKey=root\n'
+            'VerityDataBlockSizeBytes=4096\nVerityHashBlockSizeBytes=4096\n'
+        )
+        (definitions / "30-signature.conf").write_text(
+            '[Partition]\nType=root-verity-sig\nLabel=extkit-signature\n'
+            f'SizeMinBytes={SIGNATURE_BYTES}\nSizeMaxBytes={SIGNATURE_BYTES}\nReadOnly=yes\n'
+        )
+        subprocess.run([
+            REPART_TOOL, "--empty=create", "--size=auto", "--offline=yes",
+            "--dry-run=no", "--sector-size=512", "--definitions", str(definitions),
+            str(output),
+        ], check=True)
+    return ddi_request(output, request, name, version, kind)
+
+
+def install_returned_extension(image, request, returned):
+    """Install the phone's finished bytes; permit changes only in its signature slot."""
+    image, returned = Path(image), Path(returned)
+    with zipfile.ZipFile(request) as archive:
+        metadata = json.loads(archive.read("request.json"))
+    if metadata["format"] != "org.extkit.signing-request.v3":
+        fail("expected a GPT signing request")
+    if file_sha256(image) != metadata["imageSha256"]:
+        fail("original image changed after preparing the request")
+    partitions = gpt_partitions(image)
+    if partitions is None or "extkit-signature" not in partitions:
+        fail("no reserved signature partition")
+    if returned.stat().st_size != image.stat().st_size or gpt_partitions(returned) != partitions:
+        fail("phone changed the image size or GPT layout")
+    partition = partitions["extkit-signature"]
+    if partition["size"] != SIGNATURE_BYTES:
+        fail("unexpected signature partition size")
+    with returned.open("rb") as source:
+        source.seek(partition["offset"])
+        response = json.loads(source.read(partition["size"]).rstrip(b"\0"))
+    if response.get("rootHash") != metadata["rootHash"]:
+        fail("returned signature does not match the requested root hash")
+    cms = base64.b64decode(response["signature"], validate=True)
+    if not cms or len(cms) > SIGNATURE_BYTES:
+        fail("invalid signature size")
+    # The kernel establishes CMS trust at activation. The authenticated transfer
+    # identifies the phone
+    with image.open("rb") as original, returned.open("rb") as result:
+        for start, length in ((0, partition["offset"]),
+                              (partition["offset"] + partition["size"],
+                               image.stat().st_size - partition["offset"] - partition["size"])):
+            original.seek(start)
+            result.seek(start)
+            while length:
+                amount = min(length, 1024 * 1024)
+                if original.read(amount) != result.read(amount):
+                    fail("phone changed bytes outside the signature partition")
+                length -= amount
+    with returned.open("rb") as source:
+        os.fsync(source.fileno())
+    returned.replace(image)
+    descriptor = os.open(image.parent, os.O_DIRECTORY | os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def phone_sign_images(outputs, name, version, enabled):
+    failures = []
+    for kind, output in outputs.items():
+        signing_request = output.with_suffix(".extsign")
+        print(f"Sending for phone review: {signing_request}", flush=True)
+        try:
+            subprocess.run([PHONE_TOOL, "send", str(signing_request),
+                            "--kind", "extension"], check=True)
+            install_returned_extension(output, signing_request,
+                                       output.with_suffix(".signed.raw"))
+            if enabled[kind]:
+                enable_image(kind, name, output)
+            print(f"Stored signed {kind} image: {output}")
+        except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+            _, image_version = split_image_name(output)
+            print(f"Signing failed: {error}. Image and request retained. "
+                  f"Retry: extkit sign {name} {image_version} --type {kind}",
+                  file=sys.stderr)
+            failures.append(output)
+    if failures:
+        fail("phone signing did not complete for all built images")
+
+
+def command_sign(args):
+    outputs = dict(requested_images(args.name, args.version, args.kind))
+    for kind, image in outputs.items():
+        name, version = split_image_name(image)
+        request = image.with_suffix(".extsign")
+        if gpt_partitions(image) is None:
+            with tempfile.TemporaryDirectory(prefix=".extkit-ddi-", dir=image.parent) as work:
+                draft = Path(work) / "image.raw"
+                prepare_ddi(image, draft, request, name, version, kind)
+                draft.replace(image)
+        else:
+            ddi_request(image, request, name, version, kind)
+    phone_sign_images(outputs, args.name, args.version or "latest",
+                      {kind: False for kind in outputs})
+
+
+def command_boot_check(args):
+    """Boot prerequisite: no directory images, kernel-authenticated DDIs."""
+    command_sync(SimpleNamespace(kind=args.kind, boot=True))
+    loader = "systemd-sysext" if args.kind == "sysext" else "systemd-confext"
+    environment = os.environ.copy()
+    environment.update({
+        "SYSTEMD_ALLOW_USERSPACE_VERITY": "0",
+        "SYSTEMD_DISSECT_VERITY_SIGNATURE": "1",
+        "SYSTEMD_DISSECT_VERITY_SIDECAR": "0",
+    })
+    if args.kind == "sysext":
+        environment["SYSTEMD_SYSEXT_HIERARCHIES"] = ":".join(
+            "/" + hierarchy for hierarchy in KINDS["sysext"])
+    # Discovery collapses duplicate names. Inspect every search directory as
+    # well, so a shadowed directory cannot escape the boot prerequisite.
+    search_paths = ("etc/extensions", "run/extensions", "var/lib/extensions",
+                    "run/confexts", "var/lib/confexts", "usr/local/lib/confexts", "usr/lib/confexts")
+    # Reject directory attacks for either kind before authorizing either loader.
+    directories = {ROOT / relative for relative in search_paths}
+    directories.update(enabled_dir(kind) for kind in KINDS)
+    for directory in sorted(directories):
+        if directory.is_dir():
+            for entry in directory.iterdir():
+                if entry.is_dir():
+                    fail(f"boot refuses directory/subvolume extension: {entry}")
+    # image policy is not consulted for directory images.
+    # Examine ALL of systemd's discovery locations
+    discovered = subprocess.run(
+        [loader, *([f"--root={ROOT}"] if ROOT != Path("/") else []), "--json=short", "list"], check=True, capture_output=True,
+        text=True, env=environment,
+    )
+    images = json.loads(discovered.stdout or "[]")
+    if not isinstance(images, list):
+        fail("unexpected extension discovery response")
+    for image in images:
+        if image.get("type") != "raw":
+            fail(f"boot refuses non-image extension: {image.get('path', image)}")
+        path = Path(image["path"])
+        if not path.is_file() or gpt_partitions(path) is None:
+            fail(f"boot requires a GPT extension image: {path}")
+        # sysext reads release metadata using its default policy before applying
+        # the merge policy. Authenticate first, before that filesystem access.
+        subprocess.run([
+            "systemd-dissect", "--read-only", f"--image-policy={SIGNED_POLICY}",
+            "--with", str(path), "/usr/bin/true",
+        ], check=True, env=environment)
+    mutable = ROOT / "var/lib/extensions.mutable"
+    if (mutable.resolve() != (RUNTIME_DIRECTORY / "extensions.mutable").resolve()
+            or not mutable.resolve().is_relative_to(RUNTIME_DIRECTORY.resolve())):
+        fail("mutable extension data must be backed by /run, not persistent storage")
+
+
 def command_build(args):
     checked_name(args.name)
     selection = load_selection()
@@ -707,9 +1064,14 @@ def command_build(args):
             drafts[kind] = draft
         for kind, output in outputs.items():
             output.parent.mkdir(parents=True, exist_ok=True)
+            if PHONE_SIGNING:
+                ddi = Path(work) / f"{kind}-ddi.raw"
+                prepare_ddi(drafts[kind], ddi, output.with_suffix(".extsign"),
+                            args.name, str(version), kind)
+                drafts[kind] = ddi
             drafts[kind].replace(output)
         for kind, output in outputs.items():
-            if previously_enabled[kind]:
+            if previously_enabled[kind] and not PHONE_SIGNING:
                 enable_image(kind, args.name, output)
                 state = "enabled"
             else:
@@ -719,6 +1081,8 @@ def command_build(args):
     built_deletions = {"/" + str(path) for paths in grouped_deletions.values() for path in paths}
     save_selection(set(selection) - built)
     save_deletions(set(deletions) - built_deletions)
+    if PHONE_SIGNING:
+        phone_sign_images(outputs, args.name, str(version), previously_enabled)
 
 
 def command_list(args):
@@ -853,10 +1217,20 @@ def command_policy(args):
         for kind, draft in drafts.items():
             output = store_dir(kind) / f"{args.name}_{version}.raw"
             output.parent.mkdir(parents=True, exist_ok=True)
+            if PHONE_SIGNING:
+                ddi = Path(work) / f"{kind}-ddi.raw"
+                prepare_ddi(draft, ddi, output.with_suffix(".extsign"),
+                            args.name, str(version), kind)
+                draft = ddi
             draft.replace(output)
-            if enabled[kind]:
+            if enabled[kind] and not PHONE_SIGNING:
                 enable_image(kind, args.name, output)
             print(f"Rebuilt {kind} policy as {args.updates}: {output}")
+        if PHONE_SIGNING:
+            phone_sign_images(
+                {kind: store_dir(kind) / f"{args.name}_{version}.raw" for kind in drafts},
+                args.name, str(version), enabled,
+            )
 
 
 def command_sync(args):
@@ -867,13 +1241,24 @@ def command_sync(args):
         destination.unlink()
     destination.mkdir(parents=True, exist_ok=True)
     for entry in destination.iterdir():
+        if getattr(args, "boot", False) and entry.is_dir():
+            fail(f"runtime extension directory contains unmanaged directory: {entry}")
         if entry.is_symlink() or entry.is_file():
             entry.unlink()
         elif entry.is_dir():
             fail(f"runtime extension directory contains unmanaged directory: {entry}")
     source = enabled_dir(kind)
+    if getattr(args, "boot", False) and source.is_dir():
+        for entry in source.iterdir():
+            if entry.is_dir():
+                fail(f"boot refuses directory/subvolume extension: {entry}")
     for link in sorted(source.glob("*.raw")) if source.exists() else []:
         if not link.is_symlink() or not link.resolve().is_relative_to(store_dir(kind)):
+            continue
+        image = link.resolve()
+        if not image.is_file():
+            if getattr(args, "boot", False):
+                fail(f"boot refuses non-regular extension: {link}")
             continue
         (destination / link.name).symlink_to(link)
 
@@ -992,14 +1377,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, parents=[pre_parser])
     sub = parser.add_subparsers(dest="command")
     for command in ("status", "diff", "stage", "unstage", "build", "enable",
-                    "disable", "inspect", "compare", "policy", "sync"):
+                    "disable", "inspect", "compare", "policy", "sync", "sign", "boot-check"):
         p = sub.add_parser(command)
         p.add_argument("--type", dest="kind", choices=KINDS)
         if command == "build":
             p.add_argument("name")
         elif command in ("enable", "disable"):
             p.add_argument("targets", nargs="+")
-        elif command == "inspect":
+        elif command in ("inspect", "sign"):
             p.add_argument("name")
             p.add_argument("version", nargs="?")
         elif command == "compare":
@@ -1032,8 +1417,8 @@ def main():
             parser.error("enable expects NAME [VERSION] or '*'; disable expects NAME or '*'")
     if args.command == "compare" and len(args.versions) == 1:
         parser.error("compare expects NAME or NAME VERSION VERSION [VERSION ...]")
-    if args.command == "sync" and args.kind is None:
-        parser.error("sync requires --type")
+    if args.command in ("sync", "boot-check") and args.kind is None:
+        parser.error(f"{args.command} requires --type")
     try:
         globals()[f"command_{args.command}"](args)
         if show_help_after_status:

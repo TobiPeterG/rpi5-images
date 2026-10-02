@@ -1,0 +1,477 @@
+#!/usr/bin/python3
+"""Discover and use an ExtKit phone signer"""
+
+import argparse
+import base64
+import fcntl
+import configparser
+import glob
+import hashlib
+import json
+import os
+import secrets
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+PROTOCOL = "org.extkit.signing-network.v1"
+BINDING_DOMAIN = b"org.extkit.transport-binding.v1\n"
+PAIRING_DOMAIN = b"org.extkit.pairing.v1\0"
+EFI_CERT_X509_GUID = uuid.UUID("a5c059a1-94e4-4aa7-87b5-ab155c2bf072")
+MAX_HEADER = 64 * 1024
+
+
+class ExtKitPhoneError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Service:
+    name: str
+    address: str
+    port: int
+
+
+@dataclass(frozen=True)
+class Phone:
+    service: Service
+    info: dict
+    transport_certificate: bytes
+    extension_fingerprint: str
+    enrolled: bool
+
+
+def fail(message):
+    raise ExtKitPhoneError(message)
+
+
+def load_config(path):
+    parser = configparser.ConfigParser()
+    if not parser.read(path):
+        fail(f"configuration not found: {path}")
+    section = parser["Network"]
+    return {
+        "boot_directory": Path(section.get("BootDirectory", "/boot")),
+        "service_type": section.get("ServiceType", "_extkit-sign._tcp"),
+        "db_glob": section.get("UefiDbGlob", "/sys/firmware/efi/efivars/db-*"),
+        "extension_owner": uuid.UUID(section.get("ExtensionOwnerGuid", "48bdddca-5476-4ef5-8171-ceb413e1a549")),
+        "connect_timeout": section.getfloat("ConnectTimeoutSeconds", 10),
+        "pairing_timeout": section.getfloat("PairingTimeoutSeconds", 120),
+        "signing_timeout": section.getfloat("SigningTimeoutSeconds", 1800),
+        "poll_interval": section.getfloat("PollIntervalSeconds", 2),
+    }
+
+
+def discover_services(service_type):
+    command = ["avahi-browse", "--resolve", "--terminate", "--parsable", service_type]
+    try:
+        result = subprocess.run(command, check=False, text=True, capture_output=True, timeout=15)
+    except FileNotFoundError:
+        fail("avahi-browse is missing; install avahi-utils")
+    except subprocess.TimeoutExpired:
+        fail("local-network discovery timed out")
+    if result.returncode != 0:
+        fail((result.stderr or "avahi-browse failed").strip())
+    found = {}
+    for line in result.stdout.splitlines():
+        fields = line.split(";")
+        if len(fields) < 9 or fields[0] != "=":
+            continue
+        try:
+            service = Service(unescape_avahi(fields[3]), unescape_avahi(fields[7]), int(fields[8]))
+        except (ValueError, IndexError):
+            continue
+        found[(service.address, service.port)] = service
+    return sorted(found.values(), key=lambda item: (item.name, item.address, item.port))
+
+
+def unescape_avahi(value):
+    output = bytearray()
+    index = 0
+    encoded = value.encode("utf-8")
+    while index < len(encoded):
+        if encoded[index:index + 1] == b"\\" and encoded[index + 1:index + 4].isdigit():
+            output.append(int(encoded[index + 1:index + 4]))
+            index += 4
+        elif encoded[index:index + 2] == b"\\;":
+            output.append(ord(";")); index += 2
+        else:
+            output.append(encoded[index]); index += 1
+    return output.decode("utf-8", errors="replace")
+
+
+def recv_exact(stream, length):
+    chunks = []
+    remaining = length
+    while remaining:
+        chunk = stream.recv(min(1024 * 1024, remaining))
+        if not chunk:
+            fail("phone closed the connection early")
+        chunks.append(chunk); remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def exchange(service, request, payload=None, output=None, timeout=10, expected_peer=None, max_response=1024 * 1024):
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    with socket.create_connection((service.address, service.port), timeout=timeout) as raw:
+        with context.wrap_socket(raw, server_hostname=None) as stream:
+            peer = stream.getpeercert(binary_form=True)
+            if expected_peer is not None and not secrets.compare_digest(peer, expected_peer):
+                fail("phone TLS identity changed during the operation")
+            header = json.dumps(request, separators=(",", ":")).encode()
+            if len(header) > MAX_HEADER:
+                fail("request header is too large")
+            stream.sendall(struct.pack(">I", len(header)) + header)
+            if payload:
+                with open(payload, "rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        stream.sendall(chunk)
+            size = struct.unpack(">I", recv_exact(stream, 4))[0]
+            if not 2 <= size <= MAX_HEADER:
+                fail("phone returned an invalid response header")
+            response = json.loads(recv_exact(stream, size))
+            if not response.get("ok"):
+                fail(response.get("error", "phone rejected the request"))
+            if response.get("protocol") != PROTOCOL:
+                fail("phone uses an incompatible protocol")
+            payload_length = int(response.get("payloadLength", 0))
+            if not 0 <= payload_length <= max_response:
+                fail("phone response exceeds the size limit")
+            if output is None:
+                body = recv_exact(stream, payload_length)
+            else:
+                remaining = payload_length
+                with open(output, "wb") as destination:
+                    while remaining:
+                        chunk = stream.recv(min(1024 * 1024, remaining))
+                        if not chunk:
+                            fail("phone closed the result transfer early")
+                        destination.write(chunk); remaining -= len(chunk)
+                body = None
+            return response, body, peer
+
+
+def efi_x509_certificates(data, owner_guid=None):
+    """Return DER certificates from an EFI signature-list payload."""
+    certificates = []
+    position = 0
+    while position + 28 <= len(data):
+        signature_type = uuid.UUID(bytes_le=data[position:position + 16])
+        list_size, header_size, signature_size = struct.unpack_from("<III", data, position + 16)
+        if list_size < 28 or position + list_size > len(data) or signature_size < 16:
+            break
+        entries = position + 28 + header_size
+        end = position + list_size
+        if entries > end or (end - entries) % signature_size:
+            break
+        if signature_type == EFI_CERT_X509_GUID:
+            while entries + signature_size <= end:
+                owner = uuid.UUID(bytes_le=data[entries:entries + 16])
+                if owner_guid is None or owner == owner_guid:
+                    certificates.append(data[entries + 16:entries + signature_size])
+                entries += signature_size
+        position = end
+    return certificates
+
+
+def enrolled_certificates(pattern, owner_guid=None):
+    certificates = []
+    for name in glob.glob(pattern):
+        try:
+            data = Path(name).read_bytes()
+        except OSError:
+            continue
+        # efivarfs prefixes variable data with the four-byte EFI attributes.
+        certificates.extend(efi_x509_certificates(data[4:], owner_guid))
+    return certificates
+
+
+def binding_payload(transport_fingerprint):
+    return BINDING_DOMAIN + transport_fingerprint.lower().encode("ascii") + b"\n"
+
+
+def verify_rsa_signature(certificate, signature, payload):
+    if not shutil.which("openssl"):
+        fail("openssl is required to verify the phone identity")
+    with tempfile.TemporaryDirectory(prefix="extkit-phone-") as directory:
+        certificate_file = Path(directory, "certificate.der")
+        public_file = Path(directory, "public.pem")
+        signature_file = Path(directory, "signature.bin")
+        payload_file = Path(directory, "payload.bin")
+        certificate_file.write_bytes(certificate)
+        signature_file.write_bytes(signature)
+        payload_file.write_bytes(payload)
+        result = subprocess.run(
+            ["openssl", "x509", "-inform", "DER", "-in", str(certificate_file), "-pubkey", "-noout", "-out", str(public_file)],
+            capture_output=True,
+        )
+        if result.returncode:
+            fail("phone returned an invalid extension certificate")
+        result = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-verify", str(public_file), "-signature", str(signature_file), str(payload_file)],
+            capture_output=True,
+        )
+        if result.returncode:
+            fail("the extension key did not sign the phone transport key")
+
+
+def inspect_phone(service, enrolled_fingerprints, timeout):
+    response, _, peer = exchange(service, {"op": "info"}, timeout=timeout)
+    info = response["info"]
+    transport = base64.b64decode(info["transportCertificate"], validate=True)
+    extension = base64.b64decode(info["extensionCertificate"], validate=True)
+    signature = base64.b64decode(info["bindingSignature"], validate=True)
+    if transport != peer:
+        fail(f"{service.name}: TLS certificate differs from the advertised binding")
+    transport_fingerprint = hashlib.sha256(transport).hexdigest()
+    if transport_fingerprint != info["transportFingerprint"].lower():
+        fail(f"{service.name}: transport certificate fingerprint mismatch")
+    verify_rsa_signature(extension, signature, binding_payload(transport_fingerprint))
+    extension_fingerprint = hashlib.sha256(extension).hexdigest()
+    return Phone(service, info, transport, extension_fingerprint, extension_fingerprint in enrolled_fingerprints)
+
+
+def find_phones(config):
+    enrolled = {hashlib.sha256(item).hexdigest() for item in enrolled_certificates(config["db_glob"], config["extension_owner"])}
+    phones = []
+    errors = []
+    for service in discover_services(config["service_type"]):
+        try:
+            phones.append(inspect_phone(service, enrolled, config["connect_timeout"]))
+        except Exception as error:
+            errors.append(f"{service.name}: {error}")
+    return phones, errors
+
+
+def choose_phone(phones, heading, always_list=False):
+    if not phones:
+        fail("no compatible ExtKit signer is visible on the local network")
+    if len(phones) == 1 and not always_list:
+        return phones[0]
+    print(heading)
+    for index, phone in enumerate(phones, 1):
+        print(f"  {index}. {phone.service.name} ({phone.service.address}) {phone.extension_fingerprint[:16]}…")
+    while True:
+        try:
+            selected = int(input("Select phone: "))
+            return phones[selected - 1]
+        except (ValueError, IndexError):
+            print("Enter one of the listed numbers.", file=sys.stderr)
+
+
+def pairing_code(nonce, certificate):
+    value = int.from_bytes(hashlib.sha256(PAIRING_DOMAIN + nonce + certificate).digest()[:4], "big") % 1_000_000
+    return f"{value // 1000:03d} {value % 1000:03d}"
+
+
+def pair(phone, config):
+    nonce = secrets.token_bytes(32)
+    response, _, _ = exchange(phone.service, {"op": "pairStart", "nonce": base64.b64encode(nonce).decode()}, timeout=config["connect_timeout"], expected_peer=phone.transport_certificate)
+    pairing_id = response["pairingId"]
+    code = pairing_code(nonce, phone.transport_certificate)
+    print("\nCompare this number with the number shown on the phone:")
+    print(f"\n    {code}\n")
+    answer = input("Do all six digits match? [y/N] ").strip().lower() in {"y", "yes"}
+    response, _, _ = exchange(phone.service, {"op": "pairConfirm", "pairingId": pairing_id, "matches": answer}, expected_peer=phone.transport_certificate)
+    if not answer:
+        fail("pairing rejected locally")
+    deadline = time.monotonic() + config["pairing_timeout"]
+    while response.get("state") == "waiting" and time.monotonic() < deadline:
+        time.sleep(config["poll_interval"])
+        response, _, _ = exchange(phone.service, {"op": "pairStatus", "pairingId": pairing_id}, expected_peer=phone.transport_certificate)
+    if response.get("state") != "accepted":
+        fail("pairing was rejected on the phone or timed out")
+    return response["token"]
+
+
+def session(phone, config):
+    response, _, _ = exchange(
+        phone.service,
+        {"op": "session", "extensionFingerprint": phone.extension_fingerprint},
+        timeout=config["connect_timeout"],
+        expected_peer=phone.transport_certificate,
+    )
+    return response["token"]
+
+
+def save_artifact(phone, token, job_id, artifact, destination, config):
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".part")
+    try:
+        exchange(
+            phone.service,
+            {"op": "result", "token": token, "jobId": job_id, "artifact": artifact},
+            output=temporary,
+            timeout=config["signing_timeout"],
+            expected_peer=phone.transport_certificate,
+            max_response=(16 * 1024 * 1024 * 1024 if artifact == "extension.raw" else
+                          256 * 1024 * 1024 if artifact == "boot.img" else 8 * 1024 * 1024),
+        )
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+
+def install_boot_files(image, signature, directory):
+    """Install a downloaded pair, preserving the previous pair for recovery."""
+    directory = Path(directory)
+    image, signature = Path(image), Path(signature)
+    with image.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    lines = signature.read_text("ascii").splitlines()
+    if not lines or lines[0].lower() != digest:
+        fail("returned boot.sig does not match the downloaded boot.img")
+    if not any(line.startswith("rsa2048:") and len(line[8:].strip()) == 512
+               and all(char in "0123456789abcdefABCDEF" for char in line[8:].strip())
+               for line in lines[1:]):
+        fail("returned boot.sig has no valid RSA-2048 signature")
+    with open(directory / ".extkit-boot.lock", "a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with tempfile.TemporaryDirectory(prefix=".extkit-boot-", dir=directory) as temporary:
+            staging = Path(temporary)
+            names = ("boot.img", "boot.sig")
+            existed = {}
+            for name, source in zip(names, (image, signature)):
+                target = directory / name
+                if target.is_symlink():
+                    fail(f"boot destination must not be a symlink: {target}")
+                existed[name] = target.exists()
+                shutil.copyfile(source, staging / name)
+                with open(staging / name, "rb") as stream:
+                    os.fsync(stream.fileno())
+                if existed[name]:
+                    shutil.copyfile(target, staging / (name + ".orig"))
+                    with open(staging / (name + ".orig"), "rb") as stream:
+                        os.fsync(stream.fileno())
+            for name in names:
+                if existed[name]:
+                    os.replace(staging / (name + ".orig"), directory / (name + ".orig"))
+            os.sync()
+            try:
+                for name in names:
+                    os.replace(staging / name, directory / name)
+                os.sync()
+            except OSError:
+                for name in names:
+                    target = directory / name
+                    if existed[name]:
+                        shutil.copyfile(directory / (name + ".orig"), target)
+                    else:
+                        target.unlink(missing_ok=True)
+                os.sync()
+                raise
+
+
+def send_request(phone, token, source, kind, output, config):
+    source = Path(source)
+    if not source.is_file():
+        fail(f"input file does not exist: {source}")
+    if kind == "boot" and output is None:
+        boot_directory = config["boot_directory"]
+        # Trigger a systemd automount before checking the actual mount.
+        boot_directory.stat()
+        if not os.path.ismount(boot_directory):
+            fail(f"boot partition is not mounted at {boot_directory}")
+        if os.geteuid() != 0:
+            fail("automatic boot installation requires root; use --output to save files elsewhere")
+    response, _, _ = exchange(
+        phone.service,
+        {"op": "submit", "token": token, "kind": kind, "payloadLength": source.stat().st_size},
+        payload=source,
+        timeout=config["signing_timeout"],
+        expected_peer=phone.transport_certificate,
+    )
+    job_id = response["jobId"]
+    print(f"Request {job_id} is awaiting review and authorization on the phone.")
+    deadline = time.monotonic() + config["signing_timeout"]
+    while time.monotonic() < deadline:
+        time.sleep(config["poll_interval"])
+        status, _, _ = exchange(phone.service, {"op": "status", "token": token, "jobId": job_id}, expected_peer=phone.transport_certificate)
+        state = status["state"]
+        if state == "complete":
+            break
+        if state in {"failed", "rejected"}:
+            fail(status.get("error") or f"request was {state}")
+    else:
+        fail("timed out waiting for phone authorization")
+    if kind == "extension":
+        destination = Path(output) if output else source.with_suffix(".signed.raw")
+        save_artifact(phone, token, job_id, "extension.raw", destination, config)
+        print(f"Saved {destination}")
+    else:
+        if output is not None:
+            directory = Path(output)
+            save_artifact(phone, token, job_id, "boot.img", directory / "personalized-boot.img", config)
+            save_artifact(phone, token, job_id, "boot.sig", directory / "boot.sig", config)
+            print(f"Saved {directory / 'personalized-boot.img'} and {directory / 'boot.sig'}")
+        else:
+            with tempfile.TemporaryDirectory(prefix="extkit-phone-result-") as temporary:
+                directory = Path(temporary)
+                save_artifact(phone, token, job_id, "boot.img", directory / "boot.img", config)
+                save_artifact(phone, token, job_id, "boot.sig", directory / "boot.sig", config)
+                install_boot_files(directory / "boot.img", directory / "boot.sig", config["boot_directory"])
+            print(f"Installed boot.img and boot.sig in {config['boot_directory']}; previous files backed up with .orig suffix.")
+
+
+def command_discover(config):
+    phones, errors = find_phones(config)
+    for phone in phones:
+        trust = "Secure Boot db" if phone.enrolled else "not enrolled"
+        print(f"{phone.service.name}\t{phone.service.address}:{phone.service.port}\t{trust}\t{phone.extension_fingerprint}")
+    for error in errors:
+        print(f"ignored: {error}", file=sys.stderr)
+    return 0 if phones else 1
+
+
+def command_send(args, config):
+    phones, errors = find_phones(config)
+    enrolled = [phone for phone in phones if phone.enrolled]
+    if enrolled:
+        phone = choose_phone(enrolled, "Multiple phones have keys enrolled in Secure Boot:")
+        token = session(phone, config)
+        print(f"Authenticated {phone.service.name} through the live Secure Boot db.")
+    else:
+        for error in errors:
+            print(f"ignored: {error}", file=sys.stderr)
+        phone = choose_phone(phones, "No discovered phone is enrolled; select one for initial pairing:", always_list=True)
+        token = pair(phone, config)
+    kind = args.kind
+    if kind == "auto":
+        kind = "extension" if str(args.input).endswith(".extsign") else "boot"
+    send_request(phone, token, args.input, kind, args.output, config)
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="/etc/extkit-phone.conf")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("discover", help="list visible signers and Secure Boot enrollment status")
+    send = commands.add_parser("send", help="send an extension request or boot.img for on-phone review")
+    send.add_argument("input")
+    send.add_argument("--kind", choices=("auto", "extension", "boot"), default="auto")
+    send.add_argument("--output", help="finished GPT image path for extensions; save boot files here instead of installing them on the boot partition")
+    args = parser.parse_args(argv)
+    config = load_config(args.config)
+    return command_discover(config) if args.command == "discover" else command_send(args, config)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ExtKitPhoneError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
+        print(f"extkit-phone: {error}", file=sys.stderr)
+        raise SystemExit(1)

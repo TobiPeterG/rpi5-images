@@ -38,10 +38,12 @@ auto-firmware no
 EOF
 
 systemctl enable NetworkManager.service
+systemctl enable avahi-daemon.service
 systemctl enable sshd.service
 systemctl enable serial-getty@ttyAMA10.service
 systemctl enable systemd-sysext.service
 systemctl enable systemd-confext.service
+systemctl enable extkit-boot-check@sysext.service extkit-boot-check@confext.service
 systemctl enable var-log.mount
 
 # Run the interactive JeOS configuration wizard.

@@ -144,6 +144,11 @@ done
 }
 install -m 0644 "${uboot}" "${boot_tree}/u-boot.bin"
 
+# Keep the DTB size constant while the phone replaces part of this padding
+# with its extension/UKI signing certificate in the db authenticated payload.
+extkit_db_reserve=${work}/extkit-db-reserve.bin
+truncate -s 16384 "${extkit_db_reserve}"
+
 cat > "${work}/secure-boot.dtso" <<EOF
 /dts-v1/;
 /plugin/;
@@ -153,6 +158,8 @@ cat > "${work}/secure-boot.dtso" <<EOF
         pk = /incbin/("${key_dir}/PK.auth");
         kek = /incbin/("${key_dir}/KEK.auth");
         db = /incbin/("${key_dir}/db.auth");
+        extkit-db-reserve = /incbin/("${extkit_db_reserve}");
+        extkit-db-owner = "48bdddca-5476-4ef5-8171-ceb413e1a549";
 EOF
 if [[ -s ${key_dir}/dbx.auth ]]; then
     printf '        dbx = /incbin/("%s");\n' "${key_dir}/dbx.auth" >> "${work}/secure-boot.dtso"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Authenticate %i images and reject directory extensions before boot merge
+DefaultDependencies=no
+RequiresMountsFor=/.state
+Before=systemd-%i.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/extkit boot-check --type %i
+
+[Install]
+RequiredBy=systemd-%i.service

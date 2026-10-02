@@ -6,3 +6,4 @@
 /zypper/
 /.mkosi-private/
 __pycache__/
+/tests/
