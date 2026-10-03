@@ -2,6 +2,7 @@
 """Discover and use an ExtKit phone signer"""
 
 import argparse
+import builtins
 import base64
 import fcntl
 import configparser
@@ -30,7 +31,25 @@ MAX_HEADER = 64 * 1024
 PENDING_ENROLLMENT = Path("/run/extkit-phone/pending-enrollment")
 
 
+def print(*values, **options):
+    stream = options.get("file", sys.stdout)
+    text = options.get("sep", " ").join(str(value) for value in values)
+    lower = text.lstrip().lower()
+    color = ("31" if lower.startswith(("✗", "extkit-phone:", "phone setup did not complete")) else
+             "33" if lower.startswith(("warning:", "ignored:", "could not", "no extkit", "skipped")) else
+             "32" if lower.startswith(("✓", "received ", "installed ", "saved ", "authenticated ", "request transfer finished", "signed boot files installed")) else None)
+    if color and stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        options.pop("sep", None)
+        builtins.print(f"\033[{color}m{text}\033[0m", **options)
+    else:
+        builtins.print(*values, **options)
+
+
 class ExtKitPhoneError(RuntimeError):
+    pass
+
+
+class PhoneRequestDismissed(ExtKitPhoneError):
     pass
 
 
@@ -265,7 +284,9 @@ def choose_phone(phones, heading, always_list=False):
         print(f"  {index}. {phone.service.name} ({phone.service.address}) {phone.extension_fingerprint[:16]}…")
     while True:
         try:
-            selected = int(input("Select phone: "))
+            selected = int(input(f"Enter the phone number (1–{len(phones)}): "))
+            if not 1 <= selected <= len(phones):
+                raise ValueError
             return phones[selected - 1]
         except (ValueError, IndexError):
             print("Enter one of the listed numbers.", file=sys.stderr)
@@ -310,6 +331,7 @@ def save_artifact(phone, token, job_id, artifact, destination, config):
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".part")
+    print(f"Receiving {artifact} from the phone…", flush=True)
     try:
         exchange(
             phone.service,
@@ -321,6 +343,7 @@ def save_artifact(phone, token, job_id, artifact, destination, config):
                           256 * 1024 * 1024 if artifact == "boot.img" else 8 * 1024 * 1024),
         )
         os.replace(temporary, destination)
+        print(f"Received {artifact} ({destination.stat().st_size} bytes).", flush=True)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -377,6 +400,11 @@ def install_boot_files(image, signature, directory):
 
 
 def send_request(phone, token, source, kind, output, config):
+    job_id = submit_request(phone, token, source, kind, output, config)
+    finish_request(phone, token, job_id, Path(source), kind, output, config)
+
+
+def submit_request(phone, token, source, kind, output, config, wait=True):
     source = Path(source)
     if not source.is_file():
         fail(f"input file does not exist: {source}")
@@ -388,26 +416,122 @@ def send_request(phone, token, source, kind, output, config):
             fail(f"boot partition is not mounted at {boot_directory}")
         if os.geteuid() != 0:
             fail("automatic boot installation requires root; use --output to save files elsewhere")
+    deadline = time.monotonic() + config["signing_timeout"]
+    while True:
+        reservation, _, _ = exchange(phone.service,
+            {"op": "reserve", "token": token, "kind": kind, "payloadLength": source.stat().st_size},
+            expected_peer=phone.transport_certificate)
+        if reservation.get("state") == "accepted":
+            break
+        if reservation.get("state") != "waiting":
+            fail("phone returned an invalid queue reservation")
+        if not wait:
+            return None
+        if time.monotonic() >= deadline:
+            fail("timed out waiting for space in the phone's signing queue")
+        print(f"Waiting for phone queue space: {source.name}", flush=True)
+        time.sleep(config["poll_interval"])
+    print(f"Sending {kind} signing request ({source.stat().st_size} bytes) to {phone.service.name}…", flush=True)
     response, _, _ = exchange(
         phone.service,
-        {"op": "submit", "token": token, "kind": kind, "payloadLength": source.stat().st_size},
+        {"op": "submit", "token": token, "kind": kind, "payloadLength": source.stat().st_size,
+         "reservationId": reservation["reservationId"]},
         payload=source,
         timeout=config["signing_timeout"],
         expected_peer=phone.transport_certificate,
     )
     job_id = response["jobId"]
+    print("Request transfer finished.", flush=True)
     print(f"Request {job_id} is awaiting review and authorization on the phone.")
+    return job_id
+
+
+def finish_request(phone, token, job_id, source, kind, output, config, ready=False):
     deadline = time.monotonic() + config["signing_timeout"]
     while time.monotonic() < deadline:
+        if ready:
+            break
         time.sleep(config["poll_interval"])
         status, _, _ = exchange(phone.service, {"op": "status", "token": token, "jobId": job_id}, expected_peer=phone.transport_certificate)
         state = status["state"]
         if state == "complete":
             break
-        if state in {"failed", "rejected"}:
+        if state == "rejected":
+            raise PhoneRequestDismissed(status.get("error") or "Request dismissed on the phone")
+        if state == "failed":
             fail(status.get("error") or f"request was {state}")
     else:
         fail("timed out waiting for phone authorization")
+    try:
+        receive_results(phone, token, job_id, source, kind, output, config)
+    except (OSError, ExtKitPhoneError, ValueError) as error:
+        try:
+            exchange(phone.service, {"op": "received", "token": token, "jobId": job_id,
+                                    "success": False, "error": str(error)[:512]},
+                     expected_peer=phone.transport_certificate)
+        except (OSError, ExtKitPhoneError, ValueError):
+            pass
+        raise
+    exchange(phone.service, {"op": "received", "token": token, "jobId": job_id,
+                            "success": True}, expected_peer=phone.transport_certificate)
+    print("✓ Signing and return transfer completed.", flush=True)
+
+
+def send_batch(phone, token, inputs, config):
+    """Upload while capacity permits, then drain results to free queue bytes."""
+    remaining = list(inputs)
+    pending = {}
+    failures = []
+    deadline = time.monotonic() + config["signing_timeout"]
+    waiting_notice = False
+    while remaining or pending:
+        if time.monotonic() >= deadline:
+            fail("batch signing timed out; returned images were retained")
+        while remaining:
+            path = remaining[0]
+            try:
+                job_id = submit_request(phone, token, path, "extension", None, config, wait=False)
+            except (OSError, ExtKitPhoneError, ValueError) as error:
+                print(f"✗ {path}: {error}", file=sys.stderr)
+                failures.append(remaining.pop(0))
+                continue
+            if job_id is None:
+                if not waiting_notice:
+                    print("Waiting for the phone's 2 GB queue budget to become available…", flush=True)
+                    waiting_notice = True
+                break
+            remaining.pop(0)
+            pending[job_id] = path
+            waiting_notice = False
+        for job_id, path in list(pending.items()):
+            try:
+                status, _, _ = exchange(phone.service, {"op": "status", "token": token, "jobId": job_id},
+                                        expected_peer=phone.transport_certificate)
+                if status["state"] == "complete":
+                    finish_request(phone, token, job_id, Path(path), "extension", None, config, ready=True)
+                elif status["state"] == "rejected":
+                    raise PhoneRequestDismissed(status.get("error") or "Dismissed on the phone")
+                elif status["state"] == "failed":
+                    fail(status.get("error") or "Phone signing failed")
+                else:
+                    continue
+            except PhoneRequestDismissed as error:
+                print(f"✗ {path}: {error}", file=sys.stderr)
+                if sys.stdin.isatty() and input(f"Send {Path(path).name} again? [y/N] ").strip().lower() in {"y", "yes"}:
+                    remaining.append(path)
+                else:
+                    failures.append(path)
+            except (OSError, ExtKitPhoneError, ValueError) as error:
+                print(f"✗ {path}: {error}", file=sys.stderr)
+                failures.append(path)
+            del pending[job_id]
+        if remaining or pending:
+            time.sleep(config["poll_interval"])
+    if failures:
+        fail(f"{len(failures)} signing request(s) did not complete; successfully returned images were retained")
+
+
+def receive_results(phone, token, job_id, source, kind, output, config):
     if kind == "extension":
         destination = Path(output) if output else source.with_suffix(".signed.raw")
         save_artifact(phone, token, job_id, "extension.raw", destination, config)
@@ -505,7 +629,12 @@ def command_setup(config):
               "in the live Secure Boot db. Skipping pairing.")
         return 0
     print("\nSet up your phone as an extension signer\n")
-    print(enrollment_instructions(config))
+    print("Open ExtSigner on your phone and start its secure receiver.\n"
+          "Connect both devices to the same local network. This wizard will find\n"
+          "your phone, send boot.img for review, and install the signed files.\n"
+          "Compare all six digits on both devices and approve signing on the phone.\n"
+          "Reboot after firstboot finishes to activate the phone's signing key.\n"
+          "This procedure does not write OTP or change EEPROM configuration.")
     while True:
         answer = input("\nSet up phone signing now? [Y/n] ").strip().lower()
         if answer not in {"", "y", "yes"}:
@@ -518,6 +647,9 @@ def command_setup(config):
                 input=str(config["boot_directory"] / "boot.img"),
                 kind="boot", output=None,
             ), config)
+        except PhoneRequestDismissed:
+            print("Phone setup was dismissed. Run extkit-phone setup when you are ready to try again.")
+            return 0
         except (ExtKitPhoneError, OSError, ValueError, KeyError,
                 subprocess.CalledProcessError) as error:
             print(f"Phone setup did not complete: {error}", file=sys.stderr)
@@ -539,10 +671,27 @@ def command_send(args, config):
             print(f"ignored: {error}", file=sys.stderr)
         phone = choose_phone(phones, "No discovered phone is enrolled; select one for initial pairing:", always_list=True)
         token = pair(phone, config)
+    inputs = args.input if isinstance(args.input, list) else [args.input]
+    if len(inputs) > 1:
+        if args.output is not None or args.kind == "boot" or any(not str(path).endswith(".extsign") for path in inputs):
+            fail("batch sending accepts only .extsign extension requests and no --output")
+        if len(set(map(str, inputs))) != len(inputs):
+            fail("batch contains duplicate request paths")
+        print(f"Sending {len(inputs)} extension requests using one authenticated phone session.", flush=True)
+        send_batch(phone, token, inputs, config)
+        return 0
+    args.input = inputs[0]
     kind = args.kind
     if kind == "auto":
         kind = "extension" if str(args.input).endswith(".extsign") else "boot"
-    send_request(phone, token, args.input, kind, args.output, config)
+    while True:
+        try:
+            send_request(phone, token, args.input, kind, args.output, config)
+            break
+        except PhoneRequestDismissed as error:
+            print(f"✗ The phone dismissed the request: {error}", file=sys.stderr)
+            if not sys.stdin.isatty() or input("Send the request again? [y/N] ").strip().lower() not in {"y", "yes"}:
+                raise
     if kind == "boot" and args.output is None:
         try:
             record_pending_enrollment(phone)
@@ -561,7 +710,7 @@ def main(argv=None):
     enrollment.add_argument("--quiet", action="store_true")
     commands.add_parser("setup", help="set up phone signing if no user key is enrolled")
     send = commands.add_parser("send", help="send an extension request or boot.img for on-phone review")
-    send.add_argument("input")
+    send.add_argument("input", nargs="+", help="one boot.img, or one or more .extsign requests")
     send.add_argument("--kind", choices=("auto", "extension", "boot"), default="auto")
     send.add_argument("--output", help="finished GPT image path for extensions; save boot files here instead of installing them on the boot partition")
     args = parser.parse_args(argv)
@@ -579,5 +728,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (ExtKitPhoneError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-        print(f"extkit-phone: {error}", file=sys.stderr)
+        print(f"✗ extkit-phone: {error}", file=sys.stderr)
         raise SystemExit(1)

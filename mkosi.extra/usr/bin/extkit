@@ -2,6 +2,7 @@
 """Inspect live changes and build systemd extensions."""
 
 import argparse
+import builtins
 import base64
 import configparser
 from contextlib import contextmanager
@@ -46,6 +47,21 @@ NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 EXCLUDED_TREES = ()
 UPDATE_POLICIES = ("persistent", "current", "any")
 BLOCK_SIZE = 4096
+
+
+def print(*values, **options):
+    """Color human-readable messages"""
+    stream = options.get("file", sys.stdout)
+    text = options.get("sep", " ").join(str(value) for value in values)
+    lower = text.lstrip().lower()
+    color = ("31" if lower.startswith(("✗", "signing failed", "extkit:")) else
+             "33" if lower.startswith(("warning:", "skipped", "ignored:", "could not", "no extkit")) else
+             "32" if lower.startswith(("✓", "stored signed", "built ", "enabled ", "disabled ", "staged ", "received ", "installed ", "saved ")) else None)
+    if color and stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
+        options.pop("sep", None)
+        builtins.print(f"\033[{color}m{text}\033[0m", **options)
+    else:
+        builtins.print(*values, **options)
 DIGEST_SIZE = 32
 HASHES_PER_BLOCK = BLOCK_SIZE // DIGEST_SIZE
 
@@ -658,6 +674,8 @@ def command_status(args):
             name, _ = split_image_name(image)
             updates, version_id = embedded_update_policy(kind, image)
             policy = policy_description(updates, version_id)
+            signature, trust, _ = signature_status(image)
+            policy += f"; signature: {signature}; trust: {trust}"
             if selected:
                 mounted_now = mounted is not None and name in mounted
                 print(
@@ -727,6 +745,46 @@ def json_bytes(value):
 
 SIGNED_POLICY = "root=signed:usr=absent"
 SIGNATURE_BYTES = 16384
+
+
+def signature_status(image, verify=True):
+    """Presence is distinct from acceptance by this boot's kernel keyrings."""
+    try:
+        partitions = gpt_partitions(image)
+        if not partitions or "extkit-signature" not in partitions:
+            return "unsigned", "not trusted", "no embedded signature partition"
+        partition = partitions["extkit-signature"]
+        if partition["size"] > SIGNATURE_BYTES:
+            return "invalid", "not trusted", "oversized signature partition"
+        with Path(image).open("rb") as stream:
+            stream.seek(partition["offset"])
+            payload = stream.read(partition["size"]).rstrip(b"\0")
+        if not payload:
+            return "unsigned", "not trusted", "empty signature partition"
+        value = json.loads(payload)
+        cms = base64.b64decode(value["signature"], validate=True)
+        if not cms:
+            return "unsigned", "not trusted", "empty CMS signature"
+        if value.get("rootHash") != partitions["extkit-root"]["uuid"] + partitions["extkit-verity"]["uuid"]:
+            return "invalid", "not trusted", "signature root hash does not match GPT"
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return "invalid", "not trusted", str(error)
+    if not verify:
+        return "signed", "unchecked", "signature present"
+    if os.geteuid() != 0:
+        return "signed", "unknown (run as root)", "kernel verification requires root"
+    environment = os.environ.copy()
+    environment.update({"SYSTEMD_ALLOW_USERSPACE_VERITY": "0",
+                        "SYSTEMD_DISSECT_VERITY_SIGNATURE": "1", "SYSTEMD_DISSECT_VERITY_SIDECAR": "0"})
+    try:
+        result = subprocess.run(["systemd-dissect", "--read-only", f"--image-policy={SIGNED_POLICY}",
+                                 "--with", str(image), "/usr/bin/true"],
+                                capture_output=True, text=True, env=environment, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return "signed", "unknown (verification unavailable)", str(error)
+    if result.returncode == 0:
+        return "signed", "trusted", "accepted by kernel signed-image verification"
+    return "signed", "not trusted/usable", (result.stderr or "kernel verification failed").strip()
 
 
 def gpt_partitions(image):
@@ -912,16 +970,25 @@ def install_returned_extension(image, request, returned):
 
 
 def phone_sign_images(outputs, name, version, enabled):
+    sign_image_batch([(kind, output, enabled[kind]) for kind, output in outputs.items()])
+
+
+def sign_image_batch(targets):
     failures = []
-    for kind, output in outputs.items():
+    for _, output, _ in targets:
+        output.with_suffix(".signed.raw").unlink(missing_ok=True)
+    requests = [str(output.with_suffix(".extsign")) for _, output, _ in targets]
+    try:
+        subprocess.run([PHONE_TOOL, "send", *requests, "--kind", "extension"], check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"Warning: batch signing did not fully complete: {error}. Checking returned images.", file=sys.stderr)
+    for kind, output, was_enabled in targets:
+        name, _ = split_image_name(output)
         signing_request = output.with_suffix(".extsign")
-        print(f"Sending for phone review: {signing_request}", flush=True)
         try:
-            subprocess.run([PHONE_TOOL, "send", str(signing_request),
-                            "--kind", "extension"], check=True)
             install_returned_extension(output, signing_request,
                                        output.with_suffix(".signed.raw"))
-            if enabled[kind]:
+            if was_enabled:
                 enable_image(kind, name, output)
             print(f"Stored signed {kind} image: {output}")
         except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
@@ -935,8 +1002,20 @@ def phone_sign_images(outputs, name, version, enabled):
 
 
 def command_sign(args):
-    outputs = dict(requested_images(args.name, args.version, args.kind))
-    for kind, image in outputs.items():
+    if getattr(args, "untrusted", False) and os.geteuid() != 0:
+        fail("sign --untrusted requires root to test kernel trust")
+    if args.name is None:
+        targets = [(kind, image) for kind in KINDS if args.kind is None or kind == args.kind
+                   for image, _, _ in stored_extension_states(kind)
+                   if (signature_status(image)[1] != "trusted" if args.untrusted else
+                       signature_status(image, verify=False)[0] != "signed")]
+    else:
+        targets = list(requested_images(args.name, args.version, args.kind))
+    if not targets:
+        print("No extensions need signing.")
+        return
+    enabled = []
+    for kind, image in targets:
         name, version = split_image_name(image)
         request = image.with_suffix(".extsign")
         if gpt_partitions(image) is None:
@@ -946,8 +1025,9 @@ def command_sign(args):
                 draft.replace(image)
         else:
             ddi_request(image, request, name, version, kind)
-    phone_sign_images(outputs, args.name, args.version or "latest",
-                      {kind: False for kind in outputs})
+        link = enabled_dir(kind) / f"{name}.raw"
+        enabled.append((kind, image, link.is_symlink() and link.resolve() == image.resolve()))
+    sign_image_batch(enabled)
 
 
 def command_boot_check(args):
@@ -1093,7 +1173,7 @@ def command_build(args):
     built_deletions = {"/" + str(path) for paths in grouped_deletions.values() for path in paths}
     save_selection(set(selection) - built)
     save_deletions(set(deletions) - built_deletions)
-    if PHONE_SIGNING:
+    if PHONE_SIGNING and not getattr(args, "no_sign", False):
         phone_sign_images(outputs, args.name, str(version), previously_enabled)
 
 
@@ -1109,7 +1189,8 @@ def command_list(args):
             name, _ = parsed
             link = enabled_dir(kind) / f"{name}.raw"
             status = "enabled" if link.is_symlink() and link.resolve() == image.resolve() else "disabled"
-            print(f"{kind}\t{name}\t{image.name}\t{status}")
+            signature, trust, _ = signature_status(image)
+            print(f"{kind}\t{name}\t{image.name}\t{status}\tsignature: {signature}\ttrust: {trust}")
 
 
 def version_key(value):
@@ -1398,8 +1479,10 @@ def main():
         elif command in ("enable", "disable"):
             p.add_argument("targets", nargs="+")
         elif command in ("inspect", "sign"):
-            p.add_argument("name")
+            p.add_argument("name", **({"nargs": "?"} if command == "sign" else {}))
             p.add_argument("version", nargs="?")
+            if command == "sign":
+                p.add_argument("--untrusted", action="store_true", help="sign every image not accepted by the current kernel trust policy")
         elif command == "compare":
             p.add_argument("name")
             p.add_argument("versions", nargs="*")
@@ -1412,6 +1495,7 @@ def main():
             p.add_argument("paths", nargs="*")
         if command == "build":
             p.add_argument("--updates", choices=UPDATE_POLICIES)
+            p.add_argument("--no-sign", action="store_true", help="prepare images now and sign them later with extkit sign")
     sub.add_parser("list").add_argument("--type", dest="kind", choices=KINDS)
     args = parser.parse_args()
     show_help_after_status = args.command is None
@@ -1438,7 +1522,8 @@ def main():
             print()
             parser.print_help()
     except (ValueError, OSError, subprocess.CalledProcessError, KeyError, configparser.Error) as exc:
-        parser.exit(1, f"extkit: {exc}\n")
+        print(f"extkit: {exc}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
