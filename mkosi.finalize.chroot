@@ -81,3 +81,10 @@ for modules_dir in /usr/lib/modules/*; do
 
     cp --reflink=auto --preserve=mode,timestamps "${kernel_image}" "${modules_dir}/vmlinuz"
 done
+
+# Firmware RPMs require dracut for installation-time scriptlets. Keep their
+# firmware files, but omit the unused initrd generator from the final image.
+# Dependency-resolving removal would uninstall the firmware as well.
+if rpm -q dracut >/dev/null 2>&1; then
+    rpm -e --nodeps dracut
+fi
