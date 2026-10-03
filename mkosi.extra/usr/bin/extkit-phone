@@ -139,6 +139,32 @@ def recv_exact(stream, length):
     return b"".join(chunks)
 
 
+class TransferProgress:
+    """Single-line progress on interactive terminals."""
+
+    def __init__(self, label, total, stream=None):
+        self.stream = sys.stderr if stream is None else stream
+        self.label, self.total = label, total
+        self.enabled = self.stream.isatty()
+        self.last = 0.0
+        self.update(0, force=True)
+
+    def update(self, completed, force=False):
+        now = time.monotonic()
+        if not self.enabled or (not force and completed != self.total and now - self.last < 0.5):
+            return
+        self.last = now
+        percent = min(100, completed * 100 // self.total) if self.total else 100
+        filled = percent * 24 // 100
+        self.stream.write(f"\r{self.label} [{'#' * filled}{'-' * (24 - filled)}] {percent:3d}% {completed}/{self.total} bytes")
+        self.stream.flush()
+
+    def finish(self):
+        if self.enabled:
+            self.stream.write("\n")
+            self.stream.flush()
+
+
 def exchange(service, request, payload=None, output=None, timeout=10, expected_peer=None, max_response=1024 * 1024):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.check_hostname = False
@@ -154,9 +180,16 @@ def exchange(service, request, payload=None, output=None, timeout=10, expected_p
                 fail("request header is too large")
             stream.sendall(struct.pack(">I", len(header)) + header)
             if payload:
-                with open(payload, "rb") as source:
-                    while chunk := source.read(1024 * 1024):
-                        stream.sendall(chunk)
+                progress = TransferProgress("Sending", Path(payload).stat().st_size)
+                completed = 0
+                try:
+                    with open(payload, "rb") as source:
+                        while chunk := source.read(1024 * 1024):
+                            stream.sendall(chunk)
+                            completed += len(chunk)
+                            progress.update(completed)
+                finally:
+                    progress.finish()
             size = struct.unpack(">I", recv_exact(stream, 4))[0]
             if not 2 <= size <= MAX_HEADER:
                 fail("phone returned an invalid response header")
@@ -172,12 +205,17 @@ def exchange(service, request, payload=None, output=None, timeout=10, expected_p
                 body = recv_exact(stream, payload_length)
             else:
                 remaining = payload_length
-                with open(output, "wb") as destination:
-                    while remaining:
-                        chunk = stream.recv(min(1024 * 1024, remaining))
-                        if not chunk:
-                            fail("phone closed the result transfer early")
-                        destination.write(chunk); remaining -= len(chunk)
+                progress = TransferProgress("Receiving", payload_length)
+                try:
+                    with open(output, "wb") as destination:
+                        while remaining:
+                            chunk = stream.recv(min(1024 * 1024, remaining))
+                            if not chunk:
+                                fail("phone closed the result transfer early")
+                            destination.write(chunk); remaining -= len(chunk)
+                            progress.update(payload_length - remaining)
+                finally:
+                    progress.finish()
                 body = None
             return response, body, peer
 
