@@ -140,6 +140,15 @@ def recv_exact(stream, length):
     return b"".join(chunks)
 
 
+def human_size(size):
+    """Format a byte count with binary units."""
+    value = size
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB", "PiB"):
+        if value < 1024 or unit == "PiB":
+            return f"{value} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+
 class TransferProgress:
     """Single-line progress on interactive terminals."""
 
@@ -157,7 +166,7 @@ class TransferProgress:
         self.last = now
         percent = min(100, completed * 100 // self.total) if self.total else 100
         filled = percent * 24 // 100
-        self.stream.write(f"\r{self.label} [{'#' * filled}{'-' * (24 - filled)}] {percent:3d}% {completed}/{self.total} bytes")
+        self.stream.write(f"\r{self.label} [{'#' * filled}{'-' * (24 - filled)}] {percent:3d}% {human_size(completed)} / {human_size(self.total)}")
         self.stream.flush()
 
     def finish(self):
@@ -382,7 +391,7 @@ def save_artifact(phone, token, job_id, artifact, destination, config):
                           256 * 1024 * 1024 if artifact == "boot.img" else 8 * 1024 * 1024),
         )
         os.replace(temporary, destination)
-        print(f"Received {artifact} ({destination.stat().st_size} bytes).", flush=True)
+        print(f"Received {artifact} ({human_size(destination.stat().st_size)}).", flush=True)
         return response
     finally:
         temporary.unlink(missing_ok=True)
@@ -548,7 +557,7 @@ def submit_request(phone, token, source, kind, output, config, wait=True):
             fail("timed out waiting for space in the phone's signing queue")
         print(f"Waiting for phone queue space: {source.name}", flush=True)
         time.sleep(config["poll_interval"])
-    print(f"Sending {kind} signing request ({source.stat().st_size} bytes) to {phone.service.name}…", flush=True)
+    print(f"Sending {kind} signing request ({human_size(source.stat().st_size)}) to {phone.service.name}…", flush=True)
     response, _, _ = exchange(
         phone.service,
         {"op": "submit", "token": token, "kind": kind, "payloadLength": source.stat().st_size,
