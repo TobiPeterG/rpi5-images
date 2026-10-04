@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import difflib
 import fnmatch
+import fcntl
 import glob
 import hashlib
 import json
@@ -658,6 +659,7 @@ def command_status(args):
     for path in sorted(changed - selection - deletions):
         print(f"  {path}")
     print("Extensions:")
+    print_quarantine(args.kind)
     for kind in KINDS:
         if args.kind is not None and kind != args.kind:
             continue
@@ -672,7 +674,11 @@ def command_status(args):
         print("    images:")
         for image, selected, link in states:
             name, _ = split_image_name(image)
-            updates, version_id = embedded_update_policy(kind, image)
+            try:
+                updates, version_id = embedded_update_policy(kind, image)
+            except (OSError, ValueError, subprocess.CalledProcessError) as error:
+                print(f"      {image.name}: unreadable; {error}")
+                continue
             policy = policy_description(updates, version_id)
             signature, trust, _ = signature_status(image)
             policy += f"; signature: {signature}; trust: {trust}"
@@ -794,6 +800,8 @@ def gpt_partitions(image):
         header = bytearray(stream.read(512))
         if header[:8] != b"EFI PART":
             return None
+        if len(header) < 92:
+            fail("truncated GPT header")
         header_size = struct.unpack_from("<I", header, 12)[0]
         if not 92 <= header_size <= 512:
             fail("invalid GPT header size")
@@ -1030,9 +1038,97 @@ def command_sign(args):
     sign_image_batch(enabled)
 
 
+def extension_search_directories():
+    paths = {
+        "sysext": ("etc/extensions", "run/extensions", "var/lib/extensions"),
+        "confext": ("run/confexts", "var/lib/confexts", "usr/local/lib/confexts", "usr/lib/confexts"),
+    }
+    return {kind: {ROOT / relative for relative in paths[kind]} |
+            {enabled_dir(kind), runtime_dir(kind)} for kind in KINDS}
+
+
+def quarantine_extension(path, kind, reason):
+    """Move discovery entries out of service search paths, preserving stored images."""
+    path = Path(path)
+    target = path.resolve()
+    candidates = {path: kind}
+    # Disable all aliases of this image, not just the name returned by discovery.
+    for other_kind, directories in extension_search_directories().items():
+        for directory in directories:
+            if directory.is_dir():
+                for entry in directory.iterdir():
+                    if entry.is_symlink() and entry.resolve() == target:
+                        candidates[entry] = other_kind
+    root = STATE / "quarantine"
+    root.mkdir(parents=True, exist_ok=True)
+    if root.is_symlink() or not root.resolve().is_relative_to(STATE.resolve()):
+        fail("quarantine must be inside StateDirectory, not a symlink")
+    for entry, entry_kind in sorted(candidates.items()):
+        if not entry.exists() and not entry.is_symlink():
+            continue
+        slot = root / uuid.uuid4().hex
+        slot.mkdir(mode=0o700)
+        record = {"kind": entry_kind, "name": entry.name, "original": str(entry),
+                  "target": str(target), "reason": str(reason)[:4096],
+                  "time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        (slot / "record.json").write_bytes(json_bytes(record))
+        try:
+            # shutil.move preserves symlinks instead of following them. Managed
+            shutil.move(str(entry), str(slot / "entry"))
+        except OSError as error:
+            fail(f"cannot quarantine {entry}; refusing extension merge: {error}")
+        print(f"WARNING: Quarantined {entry}: {reason}", file=sys.stderr)
+
+
+def print_quarantine(kind=None):
+    root = STATE / "quarantine"
+    records = []
+    for slot in sorted(root.iterdir()) if root.is_dir() and not root.is_symlink() else []:
+        if not slot.is_dir() or slot.is_symlink():
+            continue
+        try:
+            record = json.loads((slot / "record.json").read_text())
+            if kind is None or record.get("kind") == kind:
+                records.append((slot, record))
+        except (OSError, ValueError):
+            print(f"  quarantine: unreadable record at {slot}")
+    print("  quarantine:" if records else "  quarantine: none")
+    for slot, record in records:
+        print(f"    {record['kind']}/{record['name']}: {record['reason']}\n"
+              f"      since {record['time']}; original: {record['original']}; saved: {slot / 'entry'}")
+
+
+def authenticate_extension_or_quarantine(path, kind, environment):
+    try:
+        if not path.is_file() or gpt_partitions(path) is None:
+            raise ValueError("boot requires a regular GPT extension image")
+    except (ValueError, OSError) as error:
+        quarantine_extension(path, kind, error)
+        return False
+    try:
+        subprocess.run([
+            "systemd-dissect", "--read-only", f"--image-policy={SIGNED_POLICY}",
+            "--with", str(path), "/usr/bin/true",
+        ], check=True, env=environment, capture_output=True, text=True, timeout=60)
+    except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        quarantine_extension(path, kind, getattr(error, "stderr", None) or str(error))
+        return False
+    return True
+
+
 def command_boot_check(args):
+    # Both services scan shared discovery paths; serialize quarantine and sync
+    # so they cannot race while moving the same malicious entry.
+    RUNTIME_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(RUNTIME_DIRECTORY / "extkit-boot-check.lock",
+                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        boot_check_locked(args)
+
+
+def boot_check_locked(args):
     """Boot prerequisite: no directory images, kernel-authenticated DDIs."""
-    command_sync(SimpleNamespace(kind=args.kind, boot=True))
     loader = "systemd-sysext" if args.kind == "sysext" else "systemd-confext"
     environment = os.environ.copy()
     environment.update({
@@ -1045,16 +1141,23 @@ def command_boot_check(args):
             "/" + hierarchy for hierarchy in KINDS["sysext"])
     # Discovery collapses duplicate names. Inspect every search directory as
     # well, so a shadowed directory cannot escape the boot prerequisite.
-    search_paths = ("etc/extensions", "run/extensions", "var/lib/extensions",
-                    "run/confexts", "var/lib/confexts", "usr/local/lib/confexts", "usr/lib/confexts")
-    # Reject directory attacks for either kind before authorizing either loader.
-    directories = {ROOT / relative for relative in search_paths}
-    directories.update(enabled_dir(kind) for kind in KINDS)
-    for directory in sorted(directories):
-        if directory.is_dir():
-            for entry in directory.iterdir():
-                if entry.is_dir():
-                    fail(f"boot refuses directory/subvolume extension: {entry}")
+    # Remove directory attacks even if shadowed by another discovery entry.
+    for kind, directories in extension_search_directories().items():
+        for directory in sorted(directories):
+            if directory.is_dir():
+                for entry in list(directory.iterdir()):
+                    if entry.is_dir():
+                        quarantine_extension(entry, kind, "directory/subvolume extensions are not authenticated images")
+    command_sync(SimpleNamespace(kind=args.kind, boot=True))
+    # Verify individual candidates before asking systemd to read release metadata:
+    authenticated = set()
+    for directory in sorted(extension_search_directories()[args.kind]):
+        for path in sorted(directory.glob("*.raw")) if directory.is_dir() else []:
+            if not path.exists() and not path.is_symlink():
+                continue
+            resolved = path.resolve()
+            if resolved not in authenticated and authenticate_extension_or_quarantine(path, args.kind, environment):
+                authenticated.add(resolved)
     # image policy is not consulted for directory images.
     # Examine ALL of systemd's discovery locations
     discovered = subprocess.run(
@@ -1066,16 +1169,13 @@ def command_boot_check(args):
         fail("unexpected extension discovery response")
     for image in images:
         if image.get("type") != "raw":
-            fail(f"boot refuses non-image extension: {image.get('path', image)}")
+            quarantine_extension(Path(image["path"]), args.kind, "non-image extension")
+            continue
         path = Path(image["path"])
-        if not path.is_file() or gpt_partitions(path) is None:
-            fail(f"boot requires a GPT extension image: {path}")
         # sysext reads release metadata using its default policy before applying
         # the merge policy. Authenticate first, before that filesystem access.
-        subprocess.run([
-            "systemd-dissect", "--read-only", f"--image-policy={SIGNED_POLICY}",
-            "--with", str(path), "/usr/bin/true",
-        ], check=True, env=environment)
+        if path.resolve() not in authenticated:
+            authenticate_extension_or_quarantine(path, args.kind, environment)
     mutable = ROOT / "var/lib/extensions.mutable"
     if (mutable.resolve() != (RUNTIME_DIRECTORY / "extensions.mutable").resolve()
             or not mutable.resolve().is_relative_to(RUNTIME_DIRECTORY.resolve())):
@@ -1091,6 +1191,32 @@ def warn_if_signing_key_unenrolled():
              "images signed by an untrusted key. Run 'extkit-phone setup' and reboot. "
              "If boot.img is already personalized, reboot to load its key. "
              f"({error})", file=sys.stderr)
+
+
+def offer_build_signing(outputs, name, version, enabled, no_sign=False):
+    print("WARNING: These images cannot be loaded under the signed-image policy until "
+          "they are signed by a trusted key. Their contents take effect only after "
+          "the extensions are enabled and merged (mounted).", file=sys.stderr)
+    sign_now = False
+    if not no_sign:
+        while True:
+            try:
+                answer = input("Sign the built extension image(s) now? [y/N] ").strip().lower()
+            except (EOFError, OSError):
+                # No interactive input: keep the prepared images for later signing.
+                break
+            if answer in ("", "n", "no", "later"):
+                break
+            if answer in ("y", "yes", "now"):
+                sign_now = True
+                break
+            print("Enter y to sign now, or n to sign later.")
+    if sign_now:
+        phone_sign_images(outputs, name, version, enabled)
+    else:
+        print("Signing deferred. Images and signing requests have been retained.")
+        for kind in outputs:
+            print(f"Sign later: extkit sign {name} {version} --type {kind}")
 
 
 def command_build(args):
@@ -1173,8 +1299,9 @@ def command_build(args):
     built_deletions = {"/" + str(path) for paths in grouped_deletions.values() for path in paths}
     save_selection(set(selection) - built)
     save_deletions(set(deletions) - built_deletions)
-    if PHONE_SIGNING and not getattr(args, "no_sign", False):
-        phone_sign_images(outputs, args.name, str(version), previously_enabled)
+    if PHONE_SIGNING:
+        offer_build_signing(outputs, args.name, str(version), previously_enabled,
+                            no_sign=getattr(args, "no_sign", False))
 
 
 def command_list(args):
@@ -1336,7 +1463,11 @@ def command_sync(args):
     destination.mkdir(parents=True, exist_ok=True)
     for entry in destination.iterdir():
         if getattr(args, "boot", False) and entry.is_dir():
-            fail(f"runtime extension directory contains unmanaged directory: {entry}")
+            quarantine_extension(entry, kind, "unmanaged directory extension")
+            continue
+        if getattr(args, "boot", False) and entry.is_file() and not entry.is_symlink():
+            # Leave raw runtime images available for the boot checker
+            continue
         if entry.is_symlink() or entry.is_file():
             entry.unlink()
         elif entry.is_dir():
@@ -1344,17 +1475,19 @@ def command_sync(args):
     source = enabled_dir(kind)
     if getattr(args, "boot", False) and source.is_dir():
         for entry in source.iterdir():
-            if entry.is_dir():
-                fail(f"boot refuses directory/subvolume extension: {entry}")
+                if entry.is_dir():
+                    quarantine_extension(entry, kind, "directory/subvolume extension")
     for link in sorted(source.glob("*.raw")) if source.exists() else []:
         if not link.is_symlink() or not link.resolve().is_relative_to(store_dir(kind)):
             continue
         image = link.resolve()
         if not image.is_file():
             if getattr(args, "boot", False):
-                fail(f"boot refuses non-regular extension: {link}")
+                quarantine_extension(link, kind, "missing or non-regular image target")
             continue
-        (destination / link.name).symlink_to(link)
+        runtime = destination / link.name
+        if not runtime.exists() and not runtime.is_symlink():
+            runtime.symlink_to(link)
 
 
 def describe_entry(path, relative):

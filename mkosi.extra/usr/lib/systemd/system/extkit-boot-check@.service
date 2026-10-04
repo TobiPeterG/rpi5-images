@@ -1,5 +1,5 @@
 [Unit]
-Description=Authenticate %i images and reject directory extensions before boot merge
+Description=Authenticate %i images and quarantine invalid extensions before boot merge
 DefaultDependencies=no
 RequiresMountsFor=/.state
 Before=systemd-%i.service
