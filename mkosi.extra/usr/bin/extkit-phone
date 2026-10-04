@@ -607,7 +607,9 @@ def enrollment_instructions(config):
     image = config["boot_directory"] / "boot.img"
     return (
         "No ExtKit user signing key is enrolled in the live Secure Boot db.\n"
-        "On your phone, open ExtSigner and enable local-network receiving.\n"
+        "On your phone, open ExtSigner's 'Connect your Raspberry Pi' page.\n"
+        "From 'Trusted signing': Settings gear → Connection setup.\n"
+        "On 'Connect your Raspberry Pi', tap 'Start secure receiver'.\n"
         "Connect both devices to the same local network, then run as root:\n"
         f"  extkit-phone send {image} --kind boot\n"
         "Compare the six-digit code on both devices and authorize signing.\n"
@@ -667,7 +669,9 @@ def command_setup(config):
               "in the live Secure Boot db. Skipping pairing.")
         return 0
     print("\nSet up your phone as an extension signer\n")
-    print("Open ExtSigner on your phone and start its secure receiver.\n"
+    print("On your phone, open ExtSigner's 'Connect your Raspberry Pi' page.\n"
+          "From 'Trusted signing': Settings gear → Connection setup.\n"
+          "On 'Connect your Raspberry Pi', tap 'Start secure receiver'.\n"
           "Connect both devices to the same local network. This wizard will find\n"
           "your phone, send boot.img for review, and install the signed files.\n"
           "Compare all six digits on both devices and approve signing on the phone.\n"
