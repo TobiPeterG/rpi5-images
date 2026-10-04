@@ -679,28 +679,6 @@ def command_discover(config):
     return 0 if phones else 1
 
 
-def command_boot_update(config):
-    directory = config["boot_directory"]
-    directory.stat()  # Trigger the ESP automount.
-    if os.geteuid() != 0 or not os.path.ismount(directory):
-        fail("boot-update requires root and a mounted boot partition")
-    phones, errors = find_phones(config)
-    for error in errors:
-        print(f"ignored: {error}", file=sys.stderr)
-    trusted = [phone for phone in phones if phone.enrolled]
-    if not trusted:
-        fail("boot-update requires a phone whose signing key is enrolled in live Secure Boot; run extkit-phone setup first")
-    phone = choose_phone(trusted, "Select an enrolled phone for the boot update:")
-    token = session(phone, config)
-    print("Requesting the prepared signed boot image. On the phone, open Boot image update, prepare/sign an image and start the receiver.", flush=True)
-    response, _, _ = exchange(phone.service, {"op": "bootUpdate", "token": token},
-                             timeout=config["signing_timeout"], expected_peer=phone.transport_certificate)
-    print("Prepared signed boot image is ready. Receiving the boot files…", flush=True)
-    finish_request(phone, token, response["jobId"], directory / "boot.img", "boot", None, config)
-    print("✓ Boot update installed. Reboot to use it.")
-    return 0
-
-
 def has_enrolled_user_key(config):
     return bool(enrolled_certificates(config["db_glob"], config["extension_owner"]))
 
@@ -853,9 +831,8 @@ def main(argv=None):
     enrollment = commands.add_parser("check-enrollment", help="check for a user key in the live Secure Boot db")
     enrollment.add_argument("--quiet", action="store_true")
     commands.add_parser("setup", help="set up phone signing if no user key is enrolled")
-    commands.add_parser("boot-update", help="retrieve the boot image already prepared and signed on the enrolled phone")
-    send = commands.add_parser("send", help="send an extension request or boot.img for on-phone review")
-    send.add_argument("input", nargs="+", help="one boot.img, or one or more .extsign requests")
+    send = commands.add_parser("send", help="send an extension or boot signing request for on-phone review")
+    send.add_argument("input", nargs="+", help="one boot.img/.bootsign, or one or more .extsign requests")
     send.add_argument("--kind", choices=("auto", "extension", "boot"), default="auto")
     send.add_argument("--output", help="finished GPT image path for extensions; save boot files here instead of installing them on the boot partition")
     args = parser.parse_args(argv)
@@ -866,8 +843,6 @@ def main(argv=None):
         return command_check_enrollment(config, args.quiet)
     if args.command == "setup":
         return command_setup(config)
-    if args.command == "boot-update":
-        return command_boot_update(config)
     return command_send(args, config)
 
 

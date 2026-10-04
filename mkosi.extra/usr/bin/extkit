@@ -12,6 +12,7 @@ import fnmatch
 import fcntl
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -43,6 +44,7 @@ EROFS_FSCK_TOOL = None
 PHONE_SIGNING = True
 PHONE_TOOL = None
 REPART_TOOL = None
+BOOT_SETTINGS = None
 KINDS = {}
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 EXCLUDED_TREES = ()
@@ -71,10 +73,12 @@ def configure(path):
     global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPERS
     global RUNTIME_DIRECTORY, ENABLED_DIRS, RUNTIME_DIRS, EROFS_TOOL, EROFS_FSCK_TOOL
     global KINDS, EXCLUDED_TREES, PHONE_SIGNING, PHONE_TOOL, REPART_TOOL
+    global BOOT_SETTINGS
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path):
         fail(f"configuration file not found: {path}")
     paths = config["Paths"]
+    BOOT_SETTINGS = dict(config["BootUpdates"]) if config.has_section("BootUpdates") else None
     STATE = Path(paths["StateDirectory"])
     ROOT = Path(paths["RootDirectory"])
     OVERLAY_UPPERS = []
@@ -691,6 +695,46 @@ def command_status(args):
                 )
             else:
                 print(f"      {image.name}: disabled; updates: {policy}")
+    if BOOT_SETTINGS is not None and args.kind is None:
+        command_boot_update_check(args)
+
+
+def boot_updates_module():
+    path = Path(__file__).resolve().parents[1] / "lib/extkit/boot_updates.py"
+    spec = importlib.util.spec_from_file_location("extkit_boot_updates", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def boot_update_paths():
+    if BOOT_SETTINGS is None:
+        fail("configure [BootUpdates] in extkit.conf")
+    directory = Path(BOOT_SETTINGS.get("stagingdirectory", str(STATE / "boot-updates")))
+    phone_config = configparser.ConfigParser(interpolation=None)
+    phone_config.read(BOOT_SETTINGS.get("phoneconfiguration", "/etc/extkit-phone.conf"))
+    boot = Path(phone_config.get("Network", "BootDirectory", fallback="/boot"))
+    if not directory.is_absolute() or not boot.is_absolute():
+        fail("boot update paths must be absolute")
+    image_id = os_release().get("IMAGE_ID", "")
+    if not NAME_RE.fullmatch(image_id):
+        fail("IMAGE_ID missing or invalid in /usr/lib/os-release")
+    return directory, boot, image_id
+
+
+def command_boot_update_check(args):
+    directory, boot, image_id = boot_update_paths()
+    boot_updates_module().show(directory, boot, image_id, print)
+
+
+def command_boot_update(args):
+    directory, boot, image_id = boot_update_paths()
+    def confirm(prompt):
+        if not sys.stdin.isatty():
+            return False
+        return input(prompt).strip().lower() in ("", "y", "yes")
+    boot_updates_module().sign(directory, boot, image_id,
+                               PHONE_TOOL, args.version, print, confirm)
 
 
 def hash_block(block, salt):
@@ -1630,6 +1674,9 @@ def main():
             p.add_argument("--updates", choices=UPDATE_POLICIES)
             p.add_argument("--no-sign", action="store_true", help="prepare images now and sign them later with extkit sign")
     sub.add_parser("list").add_argument("--type", dest="kind", choices=KINDS)
+    sub.add_parser("boot-update-check", help="show factory boot images staged by systemd-sysupdate")
+    boot_update = sub.add_parser("boot-update", help="verify and send a staged factory boot image for phone signing")
+    boot_update.add_argument("version", nargs="?", help="staged version; defaults to newest update")
     args = parser.parse_args()
     show_help_after_status = args.command is None
     if show_help_after_status:

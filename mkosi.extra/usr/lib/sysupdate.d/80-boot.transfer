@@ -1,0 +1,14 @@
+[Transfer]
+Verify=yes
+
+[Source]
+Type=url-file
+Path=https://download.opensuse.org/repositories/home:/Tobi_Peter:/rpi5_microos_sb/mkosi/
+MatchPattern=%M_@v_%a.boot.img
+
+[Target]
+Type=regular-file
+Path=/.state/extkit/boot-updates
+MatchPattern=%M_@v_%a.boot.img
+Mode=0600
+InstancesMax=5

@@ -44,6 +44,7 @@ systemctl enable serial-getty@ttyAMA10.service
 systemctl enable systemd-sysext.service
 systemctl enable systemd-confext.service
 systemctl enable extkit-boot-check@sysext.service extkit-boot-check@confext.service
+systemctl enable extkit-boot-update-check.timer
 systemctl enable var-log.mount
 
 # Run the interactive JeOS configuration wizard.

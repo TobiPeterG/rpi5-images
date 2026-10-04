@@ -1,0 +1,10 @@
+[Unit]
+Description=Check authenticated system and factory boot updates
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/.state /boot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemd-sysupdate list
+ExecStart=/usr/bin/extkit boot-update-check
