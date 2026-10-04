@@ -188,6 +188,10 @@ bootcmd+='fi; env print -e SecureBoot; if load mmc 0:1 ${kernel_addr_r} /EFI/BOO
 
 fdtput -p -t s "${owner_dtb}" /config bootcmd "${bootcmd}"
 fdtput -p -t i -- "${owner_dtb}" /config bootdelay -2
+fdtput -p -t s "${owner_dtb}" /uefi-secure-boot extkit-image-version "${IMAGE_VERSION:?}"
+fdtput -p -t s "${owner_dtb}" /uefi-secure-boot extkit-image-id "${IMAGE_ID:?}"
+printf 'IMAGE_ID=%s\nIMAGE_VERSION=%s\nARCHITECTURE=%s\n' \
+    "${IMAGE_ID}" "${IMAGE_VERSION}" "${ARCHITECTURE}" > "${boot_tree}/EXTKIT.VER"
 install -m 0644 "${owner_dtb}" "${boot_tree}/owner-rpi5.dtb"
 
 sed -i '/^[[:space:]]*boot_ramdisk[[:space:]]*=/d' "${boot_tree}/config.txt"
@@ -231,5 +235,9 @@ if [[ -s ${rpi_key} ]] && command -v rpi-eeprom-digest >/dev/null; then
         -o "${root}/efi/boot.sig" \
         -k "${rpi_key}"
 fi
+
+
+install -m 0644 "${root}/efi/boot.img" \
+    "${OUTPUTDIR:?}/${IMAGE_ID:?}_${IMAGE_VERSION:?}_${ARCHITECTURE}.boot.img"
 
 sync

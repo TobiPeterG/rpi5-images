@@ -112,6 +112,10 @@ if [[ ${obs_build} == true ]]; then
 BuildScripts=%D/mkosi.final-output
 EOF
 else
+    [[ -s ${disk%.raw}.boot.img ]] || {
+        echo "Original factory boot.img artifact not found: ${disk%.raw}.boot.img" >&2
+        exit 1
+    }
     xz --threads=0 --keep --force "$disk"
 
     # The mkosi checksum file is generated before post-output scripts run, so
@@ -119,5 +123,6 @@ else
     (
         cd "$OUTPUTDIR"
         sha256sum "$(basename "${disk}.xz")" > "$(basename "${disk}.xz").sha256"
+        sha256sum "$(basename "${disk%.raw}.boot.img")" > "$(basename "${disk%.raw}.boot.img").sha256"
     )
 fi

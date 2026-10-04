@@ -15,5 +15,16 @@ disks=("${output_dir}"/*_"${IMAGE_VERSION}"_"${ARCHITECTURE}".raw)
 }
 
 for disk in "${disks[@]}"; do
+    boot=${disk%.raw}.boot.img
+    # mkosi-obs copies IMAGE_ID* from the first stage, but a multi-image build
+    # also needs the other variant's original factory boot image. OBS exposes
+    # all first-stage artifacts in SOURCES; preserve that file unchanged.
+    if [[ ! -s ${boot} ]]; then
+        install -m 0644 "/usr/src/packages/SOURCES/${boot##*/}" "${boot}"
+    fi
+    [[ -s ${boot} ]] || {
+        echo "Original factory boot.img artifact not found: ${boot}" >&2
+        exit 1
+    }
     xz --threads=0 --keep --force "${disk}"
 done

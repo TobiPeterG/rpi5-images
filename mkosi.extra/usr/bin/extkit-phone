@@ -10,6 +10,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -371,7 +372,7 @@ def save_artifact(phone, token, job_id, artifact, destination, config):
     temporary = destination.with_name(destination.name + ".part")
     print(f"Receiving {artifact} from the phone…", flush=True)
     try:
-        exchange(
+        response, _, _ = exchange(
             phone.service,
             {"op": "result", "token": token, "jobId": job_id, "artifact": artifact},
             output=temporary,
@@ -382,12 +383,65 @@ def save_artifact(phone, token, job_id, artifact, destination, config):
         )
         os.replace(temporary, destination)
         print(f"Received {artifact} ({destination.stat().st_size} bytes).", flush=True)
+        return response
     finally:
         temporary.unlink(missing_ok=True)
 
 
 
-def install_boot_files(image, signature, directory):
+def boot_recovery_pairs(directory):
+    return sorted((path for path in directory.glob("boot_*.img")
+                   if path.is_file() and not path.is_symlink()
+                   and re.fullmatch(r"boot_[A-Za-z0-9][A-Za-z0-9.+-]{0,127}_[0-9a-f]{12}\.img", path.name)
+                   and path.with_suffix(".sig").is_file()
+                   and not path.with_suffix(".sig").is_symlink()),
+                  key=lambda path: path.stat().st_mtime_ns)
+
+
+def make_boot_update_space(image, signature, directory, versioned):
+    """Reserve peak staging space, reclaiming only old generated recovery pairs."""
+    block = os.statvfs(directory).f_frsize or 4096
+    def allocated(path):
+        return ((path.stat().st_size + block - 1) // block) * block
+
+    # Two new copies: the versioned pair and the pending active pair. The
+    # previous versioned pair provides manual recovery
+    required = 2 * (allocated(image) + allocated(signature)) + 1024 * 1024
+    active = [directory / name for name in ("boot.img", "boot.sig")]
+    for path in active:
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            fail(f"boot destination must be a regular file: {path}")
+    active_digest = None
+    if active[0].exists():
+        with active[0].open("rb") as stream:
+            active_digest = hashlib.file_digest(stream, "sha256").hexdigest()[:12]
+    sources = {image.resolve(), signature.resolve()}
+    pairs = boot_recovery_pairs(directory)
+    matching_active = [path for path in pairs
+                       if active_digest and path.stem.endswith("_" + active_digest)]
+    protected = matching_active[-1] if matching_active else None
+    candidates = [path for path in pairs
+                  if path.stem != versioned
+                  and path != protected
+                  and path.resolve() not in sources
+                  and path.with_suffix(".sig").resolve() not in sources]
+    if shutil.disk_usage(directory).free >= required:
+        return
+    reclaimable = sum(allocated(path) + allocated(path.with_suffix(".sig")) for path in candidates)
+    if shutil.disk_usage(directory).free + reclaimable < required:
+        fail("Not enough ESP space for the boot update, even after pruning old recovery versions; active boot files and recovery versions were left unchanged")
+    for old in candidates:
+        if shutil.disk_usage(directory).free >= required:
+            return
+        old.with_suffix(".sig").unlink()
+        old.unlink()
+        os.sync()
+        print(f"Removed oldest boot recovery pair to free ESP space: {old.name} / {old.with_suffix('.sig').name}; recovery requires another copy or download.")
+    if shutil.disk_usage(directory).free < required:
+        fail("ESP still lacks staging space after pruning; active boot files were left unchanged")
+
+
+def install_boot_files(image, signature, directory, version=None):
     """Install a downloaded pair, preserving the previous pair for recovery."""
     directory = Path(directory)
     image, signature = Path(image), Path(signature)
@@ -400,41 +454,66 @@ def install_boot_files(image, signature, directory):
                and all(char in "0123456789abcdefABCDEF" for char in line[8:].strip())
                for line in lines[1:]):
         fail("returned boot.sig has no valid RSA-2048 signature")
+    version = version or "unversioned"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,127}", version):
+        fail("invalid boot image version")
+    versioned = f"boot_{version}_{digest[:12]}"
     with open(directory / ".extkit-boot.lock", "a+b") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        names = ("boot.img", "boot.sig")
+        pending = [directory / (name + ".pending") for name in names]
+        for path in pending + [directory / f"{versioned}.{suffix}" for suffix in ("img", "sig")]:
+            if path.is_symlink() or (path.exists() and not path.is_file()):
+                fail(f"boot destination must be a regular file: {path}")
+        for path in pending:
+            if path.resolve() in {image.resolve(), signature.resolve()}:
+                fail("boot update input must not be a pending destination")
+        for path in pending:
+            if path.exists():
+                path.unlink()
+                print(f"Removed stale pending boot file: {path.name}; complete versioned pairs remain available for recovery.")
+        make_boot_update_space(image, signature, directory, versioned)
         with tempfile.TemporaryDirectory(prefix=".extkit-boot-", dir=directory) as temporary:
             staging = Path(temporary)
-            names = ("boot.img", "boot.sig")
-            existed = {}
-            for name, source in zip(names, (image, signature)):
-                target = directory / name
+            for suffix, source in (("img", image), ("sig", signature)):
+                staged = staging / f"{versioned}.{suffix}"
+                target = directory / staged.name
                 if target.is_symlink():
-                    fail(f"boot destination must not be a symlink: {target}")
-                existed[name] = target.exists()
-                shutil.copyfile(source, staging / name)
-                with open(staging / name, "rb") as stream:
+                    fail(f"versioned boot destination must not be a symlink: {target}")
+                shutil.copyfile(source, staged)
+                with staged.open("rb") as stream:
                     os.fsync(stream.fileno())
-                if existed[name]:
-                    shutil.copyfile(target, staging / (name + ".orig"))
-                    with open(staging / (name + ".orig"), "rb") as stream:
-                        os.fsync(stream.fileno())
-            for name in names:
-                if existed[name]:
-                    os.replace(staging / (name + ".orig"), directory / (name + ".orig"))
+                os.replace(staged, target)
             os.sync()
             try:
-                for name in names:
-                    os.replace(staging / name, directory / name)
+                # Copy only from the fully written versioned pair. Neither
+                # active file is replaced until both pending files are flushed.
+                for suffix, path in zip(("img", "sig"), pending):
+                    shutil.copyfile(directory / f"{versioned}.{suffix}", path)
+                    with path.open("rb") as stream:
+                        os.fsync(stream.fileno())
+                os.sync()
+                for path, name in zip(pending, names):
+                    os.replace(path, directory / name)
                 os.sync()
             except OSError:
-                for name in names:
-                    target = directory / name
-                    if existed[name]:
-                        shutil.copyfile(directory / (name + ".orig"), target)
-                    else:
-                        target.unlink(missing_ok=True)
+                print("ERROR: Boot installation failed. If active files are mismatched, restore a matching versioned .img/.sig pair to boot.img/boot.sig before rebooting.", file=sys.stderr)
                 os.sync()
                 raise
+            finally:
+                for path in pending:
+                    path.unlink(missing_ok=True)
+            # Keep the current pair plus five previous pairs.
+            pairs = list(reversed(boot_recovery_pairs(directory)))
+            previous = [path for path in pairs if path.stem != versioned]
+            for old in previous[5:]:
+                try:
+                    old.unlink()
+                    old.with_suffix(".sig").unlink()
+                except OSError as error:
+                    print(f"WARNING: Boot update is installed, but could not prune {old}: {error}", file=sys.stderr)
+            os.sync()
+            print(f"✓ Saved recovery pair: {versioned}.img / {versioned}.sig")
 
 
 def send_request(phone, token, source, kind, output, config):
@@ -583,10 +662,11 @@ def receive_results(phone, token, job_id, source, kind, output, config):
         else:
             with tempfile.TemporaryDirectory(prefix="extkit-phone-result-") as temporary:
                 directory = Path(temporary)
-                save_artifact(phone, token, job_id, "boot.img", directory / "boot.img", config)
+                boot_response = save_artifact(phone, token, job_id, "boot.img", directory / "boot.img", config)
                 save_artifact(phone, token, job_id, "boot.sig", directory / "boot.sig", config)
-                install_boot_files(directory / "boot.img", directory / "boot.sig", config["boot_directory"])
-            print(f"Installed boot.img and boot.sig in {config['boot_directory']}; previous files backed up with .orig suffix.")
+                install_boot_files(directory / "boot.img", directory / "boot.sig", config["boot_directory"],
+                                   version=(boot_response or {}).get("bootVersion"))
+            print(f"Installed boot.img and boot.sig in {config['boot_directory']}; versioned recovery copies retained.")
 
 
 def command_discover(config):
@@ -597,6 +677,28 @@ def command_discover(config):
     for error in errors:
         print(f"ignored: {error}", file=sys.stderr)
     return 0 if phones else 1
+
+
+def command_boot_update(config):
+    directory = config["boot_directory"]
+    directory.stat()  # Trigger the ESP automount.
+    if os.geteuid() != 0 or not os.path.ismount(directory):
+        fail("boot-update requires root and a mounted boot partition")
+    phones, errors = find_phones(config)
+    for error in errors:
+        print(f"ignored: {error}", file=sys.stderr)
+    trusted = [phone for phone in phones if phone.enrolled]
+    if not trusted:
+        fail("boot-update requires a phone whose signing key is enrolled in live Secure Boot; run extkit-phone setup first")
+    phone = choose_phone(trusted, "Select an enrolled phone for the boot update:")
+    token = session(phone, config)
+    print("Requesting the prepared signed boot image. On the phone, open Boot image update, prepare/sign an image and start the receiver.", flush=True)
+    response, _, _ = exchange(phone.service, {"op": "bootUpdate", "token": token},
+                             timeout=config["signing_timeout"], expected_peer=phone.transport_certificate)
+    print("Prepared signed boot image is ready. Receiving the boot files…", flush=True)
+    finish_request(phone, token, response["jobId"], directory / "boot.img", "boot", None, config)
+    print("✓ Boot update installed. Reboot to use it.")
+    return 0
 
 
 def has_enrolled_user_key(config):
@@ -751,6 +853,7 @@ def main(argv=None):
     enrollment = commands.add_parser("check-enrollment", help="check for a user key in the live Secure Boot db")
     enrollment.add_argument("--quiet", action="store_true")
     commands.add_parser("setup", help="set up phone signing if no user key is enrolled")
+    commands.add_parser("boot-update", help="retrieve the boot image already prepared and signed on the enrolled phone")
     send = commands.add_parser("send", help="send an extension request or boot.img for on-phone review")
     send.add_argument("input", nargs="+", help="one boot.img, or one or more .extsign requests")
     send.add_argument("--kind", choices=("auto", "extension", "boot"), default="auto")
@@ -763,6 +866,8 @@ def main(argv=None):
         return command_check_enrollment(config, args.quiet)
     if args.command == "setup":
         return command_setup(config)
+    if args.command == "boot-update":
+        return command_boot_update(config)
     return command_send(args, config)
 
 
