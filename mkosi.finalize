@@ -20,9 +20,9 @@ trap 'rm -rf -- "${work}"' EXIT
 # next to the package sources and mkosi-obs exposes that directory verbatim in
 # the sandbox. Locate the checked-out source tree as well, because OBS invokes
 # mkosi with --directory instead of from inside that tree.
-source_dir=$(/usr/bin/bash /work/extkit-build/source-tree \
+source_dir=$(/usr/bin/bash /usr/lib/extkit-build/source-tree \
     "${CHROOT_SRCDIR:?}" /usr/src/packages/SOURCES/*)
-/usr/bin/python3 /work/extkit-build/check-packages "${source_dir}"
+/usr/bin/python3 /usr/lib/extkit-build/check-packages "${source_dir}"
 
 project_cert=/usr/src/packages/SOURCES/_projectcert.crt
 if [[ ! -s ${project_cert} ]]; then

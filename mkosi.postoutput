@@ -6,7 +6,7 @@ set -euo pipefail
 # dependency image is invalid because it also contains main-image-only
 # settings.
 obs_build=false
-source_dir=$(/usr/bin/bash /work/extkit-build/source-tree \
+source_dir=$(/usr/bin/bash /usr/lib/extkit-build/source-tree \
     "${SRCDIR:?}" /usr/src/packages/SOURCES/*)
 if [[ -s /usr/src/packages/SOURCES/_projectcert.crt ]]; then
     obs_build=true
