@@ -1,0 +1,23 @@
+#!/usr/bin/python3
+"""Keep OBS's dependency union consistent with the image recipes."""
+import configparser
+from pathlib import Path
+import sys
+
+
+def packages(path):
+    config = configparser.ConfigParser(interpolation=None)
+    config.read(path)
+    return set(config.get("Content", "Packages", fallback="").split())
+
+
+root = Path(sys.argv[1])
+required = packages(root / "mkosi.common.conf")
+for image in (root / "mkosi.images").glob("*/mkosi.conf"):
+    required |= packages(image)
+declared = packages(root / "mkosi.conf")
+# These filesystem tools are required by mkosi/OBS for disk construction.
+expected = required | {"e2fsprogs", "xfsprogs"}
+if declared != expected:
+    raise SystemExit(f"OBS package union mismatch: missing={sorted(expected - declared)}, "
+                     f"unexpected={sorted(declared - expected)}")

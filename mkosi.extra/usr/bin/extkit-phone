@@ -2,7 +2,6 @@
 """Discover and use an ExtKit phone signer"""
 
 import argparse
-import builtins
 import base64
 import fcntl
 import configparser
@@ -24,26 +23,14 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib/extkit"))
+from common import print
 PROTOCOL = "org.extkit.signing-network.v1"
 BINDING_DOMAIN = b"org.extkit.transport-binding.v1\n"
 PAIRING_DOMAIN = b"org.extkit.pairing.v1\0"
 EFI_CERT_X509_GUID = uuid.UUID("a5c059a1-94e4-4aa7-87b5-ab155c2bf072")
 MAX_HEADER = 64 * 1024
 PENDING_ENROLLMENT = Path("/run/extkit-phone/pending-enrollment")
-
-
-def print(*values, **options):
-    stream = options.get("file", sys.stdout)
-    text = options.get("sep", " ").join(str(value) for value in values)
-    lower = text.lstrip().lower()
-    color = ("31" if lower.startswith(("✗", "extkit-phone:", "phone setup did not complete")) else
-             "33" if lower.startswith(("warning:", "ignored:", "could not", "no extkit", "skipped")) else
-             "32" if lower.startswith(("✓", "received ", "installed ", "saved ", "authenticated ", "request transfer finished", "signed boot files installed")) else None)
-    if color and stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
-        options.pop("sep", None)
-        builtins.print(f"\033[{color}m{text}\033[0m", **options)
-    else:
-        builtins.print(*values, **options)
 
 
 class ExtKitPhoneError(RuntimeError):
@@ -337,7 +324,7 @@ def choose_phone(phones, heading, always_list=False):
                 raise ValueError
             return phones[selected - 1]
         except (ValueError, IndexError):
-            print("Enter one of the listed numbers.", file=sys.stderr)
+            print("Enter one of the listed numbers.", file=sys.stderr, color="yellow")
 
 
 def pairing_code(nonce, certificate):
@@ -391,7 +378,7 @@ def save_artifact(phone, token, job_id, artifact, destination, config):
                           256 * 1024 * 1024 if artifact == "boot.img" else 8 * 1024 * 1024),
         )
         os.replace(temporary, destination)
-        print(f"Received {artifact} ({human_size(destination.stat().st_size)}).", flush=True)
+        print(f"Received {artifact} ({human_size(destination.stat().st_size)}).", flush=True, color="green")
         return response
     finally:
         temporary.unlink(missing_ok=True)
@@ -445,7 +432,7 @@ def make_boot_update_space(image, signature, directory, versioned):
         old.with_suffix(".sig").unlink()
         old.unlink()
         os.sync()
-        print(f"Removed oldest boot recovery pair to free ESP space: {old.name} / {old.with_suffix('.sig').name}; recovery requires another copy or download.")
+        print(f"Removed oldest boot recovery pair to free ESP space: {old.name} / {old.with_suffix('.sig').name}; recovery requires another copy or download.", color="yellow")
     if shutil.disk_usage(directory).free < required:
         fail("ESP still lacks staging space after pruning; active boot files were left unchanged")
 
@@ -463,7 +450,8 @@ def install_boot_files(image, signature, directory, version=None):
                and all(char in "0123456789abcdefABCDEF" for char in line[8:].strip())
                for line in lines[1:]):
         fail("returned boot.sig has no valid RSA-2048 signature")
-    version = version or "unversioned"
+    if not version:
+        fail("boot image version metadata is required")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+-]{0,127}", version):
         fail("invalid boot image version")
     versioned = f"boot_{version}_{digest[:12]}"
@@ -480,7 +468,7 @@ def install_boot_files(image, signature, directory, version=None):
         for path in pending:
             if path.exists():
                 path.unlink()
-                print(f"Removed stale pending boot file: {path.name}; complete versioned pairs remain available for recovery.")
+                print(f"Removed stale pending boot file: {path.name}; complete versioned pairs remain available for recovery.", color="yellow")
         make_boot_update_space(image, signature, directory, versioned)
         with tempfile.TemporaryDirectory(prefix=".extkit-boot-", dir=directory) as temporary:
             staging = Path(temporary)
@@ -506,7 +494,7 @@ def install_boot_files(image, signature, directory, version=None):
                     os.replace(path, directory / name)
                 os.sync()
             except OSError:
-                print("ERROR: Boot installation failed. If active files are mismatched, restore a matching versioned .img/.sig pair to boot.img/boot.sig before rebooting.", file=sys.stderr)
+                print("ERROR: Boot installation failed. If active files are mismatched, restore a matching versioned .img/.sig pair to boot.img/boot.sig before rebooting.", file=sys.stderr, color="red")
                 os.sync()
                 raise
             finally:
@@ -520,9 +508,9 @@ def install_boot_files(image, signature, directory, version=None):
                     old.unlink()
                     old.with_suffix(".sig").unlink()
                 except OSError as error:
-                    print(f"WARNING: Boot update is installed, but could not prune {old}: {error}", file=sys.stderr)
+                    print(f"WARNING: Boot update is installed, but could not prune {old}: {error}", file=sys.stderr, color="yellow")
             os.sync()
-            print(f"✓ Saved recovery pair: {versioned}.img / {versioned}.sig")
+            print(f"✓ Saved recovery pair: {versioned}.img / {versioned}.sig", color="green")
 
 
 def send_request(phone, token, source, kind, output, config):
@@ -567,7 +555,7 @@ def submit_request(phone, token, source, kind, output, config, wait=True):
         expected_peer=phone.transport_certificate,
     )
     job_id = response["jobId"]
-    print("Request transfer finished.", flush=True)
+    print("Request transfer finished.", flush=True, color="green")
     print(f"Request {job_id} is awaiting review and authorization on the phone.")
     return job_id
 
@@ -600,7 +588,7 @@ def finish_request(phone, token, job_id, source, kind, output, config, ready=Fal
         raise
     exchange(phone.service, {"op": "received", "token": token, "jobId": job_id,
                             "success": True}, expected_peer=phone.transport_certificate)
-    print("✓ Signing and return transfer completed.", flush=True)
+    print("✓ Signing and return transfer completed.", flush=True, color="green")
 
 
 def send_batch(phone, token, inputs, config):
@@ -618,7 +606,7 @@ def send_batch(phone, token, inputs, config):
             try:
                 job_id = submit_request(phone, token, path, "extension", None, config, wait=False)
             except (OSError, ExtKitPhoneError, ValueError) as error:
-                print(f"✗ {path}: {error}", file=sys.stderr)
+                print(f"✗ {path}: {error}", file=sys.stderr, color="red")
                 failures.append(remaining.pop(0))
                 continue
             if job_id is None:
@@ -642,13 +630,13 @@ def send_batch(phone, token, inputs, config):
                 else:
                     continue
             except PhoneRequestDismissed as error:
-                print(f"✗ {path}: {error}", file=sys.stderr)
+                print(f"✗ {path}: {error}", file=sys.stderr, color="red")
                 if sys.stdin.isatty() and input(f"Send {Path(path).name} again? [y/N] ").strip().lower() in {"y", "yes"}:
                     remaining.append(path)
                 else:
                     failures.append(path)
             except (OSError, ExtKitPhoneError, ValueError) as error:
-                print(f"✗ {path}: {error}", file=sys.stderr)
+                print(f"✗ {path}: {error}", file=sys.stderr, color="red")
                 failures.append(path)
             del pending[job_id]
         if remaining or pending:
@@ -661,13 +649,13 @@ def receive_results(phone, token, job_id, source, kind, output, config):
     if kind == "extension":
         destination = Path(output) if output else source.with_suffix(".signed.raw")
         save_artifact(phone, token, job_id, "extension.raw", destination, config)
-        print(f"Saved {destination}")
+        print(f"Saved {destination}", color="green")
     else:
         if output is not None:
             directory = Path(output)
             save_artifact(phone, token, job_id, "boot.img", directory / "personalized-boot.img", config)
             save_artifact(phone, token, job_id, "boot.sig", directory / "boot.sig", config)
-            print(f"Saved {directory / 'personalized-boot.img'} and {directory / 'boot.sig'}")
+            print(f"Saved {directory / 'personalized-boot.img'} and {directory / 'boot.sig'}", color="green")
         else:
             with tempfile.TemporaryDirectory(prefix="extkit-phone-result-") as temporary:
                 directory = Path(temporary)
@@ -675,7 +663,7 @@ def receive_results(phone, token, job_id, source, kind, output, config):
                 save_artifact(phone, token, job_id, "boot.sig", directory / "boot.sig", config)
                 install_boot_files(directory / "boot.img", directory / "boot.sig", config["boot_directory"],
                                    version=(boot_response or {}).get("bootVersion"))
-            print(f"Installed boot.img and boot.sig in {config['boot_directory']}; versioned recovery copies retained.")
+            print(f"Installed boot.img and boot.sig in {config['boot_directory']}; versioned recovery copies retained.", color="green")
 
 
 def command_discover(config):
@@ -684,7 +672,7 @@ def command_discover(config):
         trust = "Secure Boot db" if phone.enrolled else "not enrolled"
         print(f"{phone.service.name}\t{phone.service.address}:{phone.service.port}\t{trust}\t{phone.extension_fingerprint}")
     for error in errors:
-        print(f"ignored: {error}", file=sys.stderr)
+        print(f"ignored: {error}", file=sys.stderr, color="yellow")
     return 0 if phones else 1
 
 
@@ -711,10 +699,10 @@ def enrollment_instructions(config):
 def command_check_enrollment(config, quiet=False):
     if has_enrolled_user_key(config):
         if not quiet:
-            print("ExtKit user signing key is enrolled in the live Secure Boot db.")
+            print("ExtKit user signing key is enrolled in the live Secure Boot db.", color="green")
         return 0
     if not quiet:
-        print(enrollment_instructions(config), file=sys.stderr)
+        print(enrollment_instructions(config), file=sys.stderr, color="yellow")
     return 1
 
 
@@ -751,11 +739,11 @@ def command_setup(config):
     if pending_key_needs_reboot(config):
         print("Signed boot files were installed during this boot, but the phone's key "
               "is not in the live Secure Boot db yet. Reboot to activate the key; "
-              "pairing does not need to be repeated.")
+              "pairing does not need to be repeated.", color="yellow")
         return 0
     if has_enrolled_user_key(config):
         print("Phone signing is already provisioned: an ExtKit user key is active "
-              "in the live Secure Boot db. Skipping pairing.")
+              "in the live Secure Boot db. Skipping pairing.", color="green")
         return 0
     print("\nSet up your phone as an extension signer\n")
     print("On your phone, open ExtSigner's 'Connect your Raspberry Pi' page.\n"
@@ -770,23 +758,23 @@ def command_setup(config):
         answer = input("\nSet up phone signing now? [Y/n] ").strip().lower()
         if answer not in {"", "y", "yes"}:
             print("Skipped. Extensions signed by this phone will not be trusted at boot "
-                  "until enrollment and reboot.")
+                  "until enrollment and reboot.", color="yellow")
             return 0
         try:
             subprocess.run(["systemctl", "start", "avahi-daemon.service"], check=True)
             command_send(argparse.Namespace(
-                input=str(config["boot_directory"] / "boot.img"),
+                input=[str(config["boot_directory"] / "boot.img")],
                 kind="boot", output=None,
             ), config)
         except PhoneRequestDismissed:
-            print("Phone setup was dismissed. Run extkit-phone setup when you are ready to try again.")
+            print("Phone setup was dismissed. Run extkit-phone setup when you are ready to try again.", color="yellow")
             return 0
         except (ExtKitPhoneError, OSError, ValueError, KeyError,
                 subprocess.CalledProcessError) as error:
-            print(f"Phone setup did not complete: {error}", file=sys.stderr)
+            print(f"Phone setup did not complete: {error}", file=sys.stderr, color="red")
             continue
         print("\nSigned boot files installed. Reboot after firstboot finishes to load "
-              "your signing key and allow its extensions to pass boot-time verification.")
+              "your signing key and allow its extensions to pass boot-time verification.", color="green")
         return 0
 
 
@@ -796,13 +784,13 @@ def command_send(args, config):
     if enrolled:
         phone = choose_phone(enrolled, "Multiple phones have keys enrolled in Secure Boot:")
         token = session(phone, config)
-        print(f"Authenticated {phone.service.name} through the live Secure Boot db.")
+        print(f"Authenticated {phone.service.name} through the live Secure Boot db.", color="green")
     else:
         for error in errors:
-            print(f"ignored: {error}", file=sys.stderr)
+            print(f"ignored: {error}", file=sys.stderr, color="yellow")
         phone = choose_phone(phones, "No discovered phone is enrolled; select one for initial pairing:", always_list=True)
         token = pair(phone, config)
-    inputs = args.input if isinstance(args.input, list) else [args.input]
+    inputs = args.input
     if len(inputs) > 1:
         if args.output is not None or args.kind == "boot" or any(not str(path).endswith(".extsign") for path in inputs):
             fail("batch sending accepts only .extsign extension requests and no --output")
@@ -820,7 +808,7 @@ def command_send(args, config):
             send_request(phone, token, args.input, kind, args.output, config)
             break
         except PhoneRequestDismissed as error:
-            print(f"✗ The phone dismissed the request: {error}", file=sys.stderr)
+            print(f"✗ The phone dismissed the request: {error}", file=sys.stderr, color="red")
             if not sys.stdin.isatty() or input("Send the request again? [y/N] ").strip().lower() not in {"y", "yes"}:
                 raise
     if kind == "boot" and args.output is None:
@@ -828,7 +816,7 @@ def command_send(args, config):
             record_pending_enrollment(phone)
         except (OSError, ExtKitPhoneError) as error:
             print(f"Could not save the reboot reminder: {error}. "
-                  "Reboot to activate the installed signing key.", file=sys.stderr)
+                  "Reboot to activate the installed signing key.", file=sys.stderr, color="yellow")
     return 0
 
 
@@ -859,5 +847,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except (ExtKitPhoneError, OSError, ValueError, KeyError, json.JSONDecodeError) as error:
-        print(f"✗ extkit-phone: {error}", file=sys.stderr)
+        print(f"✗ extkit-phone: {error}", file=sys.stderr, color="red")
         raise SystemExit(1)

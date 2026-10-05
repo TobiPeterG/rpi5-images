@@ -1,0 +1,12 @@
+# shellcheck shell=bash
+apply_locale() {
+    if [[ -n ${JEOS_LOCALE:-} ]]; then
+        run /usr/libexec/extkit-langset "${JEOS_LOCALE}" || warn $"Setting the locale failed"
+    fi
+}
+
+apply_locale_and_keytable() {
+    if [[ -n ${JEOS_LOCALE:-} && -n ${JEOS_KEYTABLE:-} ]]; then
+        run /usr/libexec/extkit-langset "${JEOS_LOCALE}" "${JEOS_KEYTABLE}" || warn $"Setting the keyboard layout failed"
+    fi
+}

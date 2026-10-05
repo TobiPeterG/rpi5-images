@@ -10,6 +10,8 @@ import tempfile
 import urllib.request
 import zipfile
 
+from common import print
+
 VERSION = re.compile(r"[0-9]+(?:\.[0-9]+)*\Z")
 MAX_MANIFEST = 8 * 1024 * 1024
 
@@ -160,4 +162,4 @@ def sign(directory, boot_directory, image_id, phone_tool, version=None,
         request = prepare(image, Path(work))
         output("Sending authenticated factory image for phone review…")
         subprocess.run([str(phone_tool), "send", str(request), "--kind", "boot"], check=True)
-        output("✓ Signed boot files installed with versioned recovery copies. Reboot to activate the update.")
+        output("✓ Signed boot files installed with versioned recovery copies. Reboot to activate the update.", color="green")

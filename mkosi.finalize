@@ -8,7 +8,7 @@ set -euo pipefail
 
 root=${BUILDROOT:?}
 
-work=/run/rpi5-microos-boot
+work=$(mktemp -d /run/rpi5-microos-boot.XXXXXX)
 boot_tree=${work}/boot-tree
 key_dir=${work}/uefi-keys
 owner_dtb=${work}/owner-rpi5.dtb
@@ -20,17 +20,9 @@ trap 'rm -rf -- "${work}"' EXIT
 # next to the package sources and mkosi-obs exposes that directory verbatim in
 # the sandbox. Locate the checked-out source tree as well, because OBS invokes
 # mkosi with --directory instead of from inside that tree.
-source_dir=
-for candidate in "${CHROOT_SRCDIR:?}" /usr/src/packages/SOURCES/*; do
-    if [[ -f ${candidate}/mkosi.finalize && -d ${candidate}/mkosi.keys ]]; then
-        source_dir=${candidate}
-        break
-    fi
-done
-[[ -n ${source_dir} ]] || {
-    echo "mkosi source tree not found" >&2
-    exit 1
-}
+source_dir=$(/usr/bin/bash /work/extkit-build/source-tree \
+    "${CHROOT_SRCDIR:?}" /usr/src/packages/SOURCES/*)
+/usr/bin/python3 /work/extkit-build/check-packages "${source_dir}"
 
 project_cert=/usr/src/packages/SOURCES/_projectcert.crt
 if [[ ! -s ${project_cert} ]]; then
@@ -195,17 +187,7 @@ printf 'IMAGE_ID=%s\nIMAGE_VERSION=%s\nARCHITECTURE=%s\n' \
 install -m 0644 "${owner_dtb}" "${boot_tree}/owner-rpi5.dtb"
 
 sed -i '/^[[:space:]]*boot_ramdisk[[:space:]]*=/d' "${boot_tree}/config.txt"
-cat >> "${boot_tree}/config.txt" <<'EOF'
-
-# Raspberry Pi 5 verified UEFI boot
-[pi5]
-kernel=u-boot.bin
-device_tree=owner-rpi5.dtb
-enable_uart=1
-uart_2ndstage=1
-
-[all]
-EOF
+command cat "${source_dir}/mkosi.scripts/pi5-config.txt" >> "${boot_tree}/config.txt"
 
 bytes=$(du -sb "${boot_tree}" | awk '{print $1}')
 mebibytes=$(( (bytes + 16 * 1024 * 1024 + 1024 * 1024 - 1) / (1024 * 1024) ))
@@ -224,7 +206,6 @@ done
 fsck.fat -vn "${boot_img}"
 
 install -m 0644 "${boot_img}" "${root}/efi/boot.img"
-printf 'boot_ramdisk=1\n' > "${root}/efi/config.txt"
 
 # Signing boot.img is necessarily device-owner specific. Do it automatically
 # when the owner key and Raspberry Pi signing utility are supplied.

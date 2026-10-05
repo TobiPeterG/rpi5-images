@@ -1,0 +1,9 @@
+
+# Raspberry Pi 5 verified UEFI boot
+[pi5]
+kernel=u-boot.bin
+device_tree=owner-rpi5.dtb
+enable_uart=1
+uart_2ndstage=1
+
+[all]

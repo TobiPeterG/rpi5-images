@@ -1,0 +1,15 @@
+#!/usr/bin/bash
+# Locate exactly one source tree, deduplicating sandbox aliases of that tree.
+set -euo pipefail
+declare -A candidates=()
+for candidate in "$@"; do
+    [[ -f ${candidate}/mkosi.finalize && -f ${candidate}/mkosi.final-output &&
+       -d ${candidate}/mkosi.keys && -d ${candidate}/mkosi.scripts ]] || continue
+    identity=$(stat -Lc '%d:%i' "${candidate}")
+    candidates[${identity}]=${candidate}
+done
+(( ${#candidates[@]} == 1 )) || {
+    printf 'Expected exactly one mkosi source tree, found %d\n' "${#candidates[@]}" >&2
+    exit 1
+}
+printf '%s\n' "${candidates[@]}"

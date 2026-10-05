@@ -1,0 +1,31 @@
+#!/usr/bin/bash
+# Apply JeOS language defaults without package-manager bookkeeping.
+set -euo pipefail
+
+lang=${1:?locale required}
+keytable=${2:-}
+[[ ${lang} != */* && ${keytable} != */* ]] || {
+    echo "Invalid locale or keymap" >&2
+    exit 1
+}
+lang=${lang%%.*}
+data=/usr/share/langset/${lang}
+[[ -f ${data} ]] || data=/usr/share/langset/${lang%%_*}
+[[ -f ${data} ]] || { echo "Locale not found: ${lang}" >&2; exit 1; }
+
+RC_LANG= KEYTABLE= CONSOLE_FONT= TIMEZONE=
+# These are distribution-provided defaults from the verified system image.
+source "${data}"
+[[ -z ${RC_LANG} ]] || localectl set-locale "LANG=${RC_LANG}"
+if [[ -n ${CONSOLE_FONT} ]]; then
+    if [[ -f /etc/vconsole.conf ]] && grep -q '^FONT=' /etc/vconsole.conf; then
+        sed -i "s/^FONT=.*/FONT=${CONSOLE_FONT}/" /etc/vconsole.conf
+    else
+        printf 'FONT=%s\n' "${CONSOLE_FONT}" >> /etc/vconsole.conf
+    fi
+fi
+[[ -z ${KEYTABLE} ]] || localectl set-keymap -- "${KEYTABLE}"
+if [[ -n ${TIMEZONE} && -f /usr/share/zoneinfo/${TIMEZONE} ]]; then
+    ln -sfn "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+fi
+[[ -z ${keytable} ]] || localectl set-keymap -- "${keytable}"

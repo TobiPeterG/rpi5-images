@@ -1,0 +1,13 @@
+enable NetworkManager.service
+enable avahi-daemon.service
+enable sshd.service
+enable serial-getty@.service ttyAMA10
+enable systemd-sysext.service
+enable systemd-confext.service
+enable extkit-boot-check@.service sysext confext
+enable extkit-boot-update-check.timer
+enable var-log.mount
+enable jeos-firstboot.service
+enable jeos-firstboot-marker-cleanup.service
+disable systemd-firstboot.service
+disable jeos-firstboot-snapshot.service

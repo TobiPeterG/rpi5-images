@@ -2,13 +2,13 @@
 """Inspect live changes and build systemd extensions."""
 
 import argparse
-import builtins
 import base64
 import configparser
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import difflib
 import fnmatch
+from functools import wraps
 import fcntl
 import glob
 import hashlib
@@ -29,6 +29,8 @@ import zlib
 from types import SimpleNamespace
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib/extkit"))
+from common import print, load_path_list, save_path_list, locked_state, verification_environment
 
 STATE = None
 ROOT = None
@@ -41,7 +43,6 @@ ENABLED_DIRS = {}
 RUNTIME_DIRS = {}
 EROFS_TOOL = None
 EROFS_FSCK_TOOL = None
-PHONE_SIGNING = True
 PHONE_TOOL = None
 REPART_TOOL = None
 BOOT_SETTINGS = None
@@ -52,27 +53,26 @@ UPDATE_POLICIES = ("persistent", "current", "any")
 BLOCK_SIZE = 4096
 
 
-def print(*values, **options):
-    """Color human-readable messages"""
-    stream = options.get("file", sys.stdout)
-    text = options.get("sep", " ").join(str(value) for value in values)
-    lower = text.lstrip().lower()
-    color = ("31" if lower.startswith(("✗", "signing failed", "extkit:")) else
-             "33" if lower.startswith(("warning:", "skipped", "ignored:", "could not", "no extkit")) else
-             "32" if lower.startswith(("✓", "stored signed", "built ", "enabled ", "disabled ", "staged ", "received ", "installed ", "saved ")) else None)
-    if color and stream.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM") != "dumb":
-        options.pop("sep", None)
-        builtins.print(f"\033[{color}m{text}\033[0m", **options)
-    else:
-        builtins.print(*values, **options)
 DIGEST_SIZE = 32
 HASHES_PER_BLOCK = BLOCK_SIZE // DIGEST_SIZE
+
+
+def state_transaction(function):
+    @wraps(function)
+    def transaction(*args, **kwargs):
+        # Resolve a shell-expanded '*' before creating STATE changes the cwd's
+        # directory listing used to recognize that expansion.
+        if function.__name__ in ("command_stage", "command_unstage"):
+            args[0].paths = normalize_shell_glob(args[0].paths)
+        with locked_state(STATE):
+            return function(*args, **kwargs)
+    return transaction
 
 
 def configure(path):
     global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPERS
     global RUNTIME_DIRECTORY, ENABLED_DIRS, RUNTIME_DIRS, EROFS_TOOL, EROFS_FSCK_TOOL
-    global KINDS, EXCLUDED_TREES, PHONE_SIGNING, PHONE_TOOL, REPART_TOOL
+    global KINDS, EXCLUDED_TREES, PHONE_TOOL, REPART_TOOL
     global BOOT_SETTINGS
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path):
@@ -146,7 +146,6 @@ def configure(path):
     EXCLUDED_TREES = tuple(excluded)
     EROFS_TOOL = config["Build"]["ErofsTool"]
     EROFS_FSCK_TOOL = config["Build"].get("ErofsFsckTool", "fsck.erofs")
-    PHONE_SIGNING = config["Build"].getboolean("PhoneSigning", fallback=True)
     PHONE_TOOL = config["Build"].get("PhoneTool", "/usr/bin/extkit-phone")
     REPART_TOOL = config["Build"].get("RepartTool", "systemd-repart")
     for name, value in (("StateDirectory", STATE), ("RootDirectory", ROOT),
@@ -217,21 +216,11 @@ def selection_file():
 
 
 def load_selection():
-    path = selection_file()
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text())
-    if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
-        fail(f"invalid selection: {path}")
-    return sorted(set(data))
+    return load_path_list(selection_file())
 
 
 def save_selection(paths):
-    path = selection_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(set(paths)), indent=2) + "\n")
-    tmp.replace(path)
+    save_path_list(selection_file(), paths)
 
 
 def deletion_file():
@@ -239,21 +228,11 @@ def deletion_file():
 
 
 def load_deletions():
-    path = deletion_file()
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text())
-    if not isinstance(data, list) or any(not isinstance(item, str) for item in data):
-        fail(f"invalid deletion selection: {path}")
-    return sorted(set(data))
+    return load_path_list(deletion_file())
 
 
 def save_deletions(paths):
-    path = deletion_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(set(paths)), indent=2) + "\n")
-    tmp.replace(path)
+    save_path_list(deletion_file(), paths)
 
 
 def upper_candidates(relative):
@@ -408,20 +387,17 @@ def requested_images(name, version=None, kind=None):
 @contextmanager
 def image_tree(image):
     """Extract an image into a private temporary tree for inspection or inheritance."""
-    RUNTIME_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="extkit-image-", dir=RUNTIME_DIRECTORY) as directory:
+    work = STATE / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="extkit-image-", dir=work) as directory:
         tree = Path(directory) / "tree"
         tree.mkdir()
-        filesystem = image
         partitions = gpt_partitions(image)
-        if partitions is not None:
-            if "extkit-root" not in partitions:
-                fail("no ExtKit filesystem partition in image")
-            filesystem = Path(directory) / "extension.erofs"
-            copy_partition(image, partitions["extkit-root"], filesystem)
+        if not partitions or "extkit-root" not in partitions:
+            fail("expected an ExtKit GPT extension image")
         subprocess.run([
-            EROFS_FSCK_TOOL, f"--extract={tree}", "--overwrite", "--preserve",
-            str(filesystem),
+            EROFS_FSCK_TOOL, f"--offset={partitions['extkit-root']['offset']}",
+            f"--extract={tree}", "--overwrite", "--preserve", str(image),
         ], check=True)
         yield tree
 
@@ -431,9 +407,9 @@ def copy_image_tree(image, destination):
         subprocess.run(["cp", "-a", f"{source}/.", str(destination)], check=True)
 
 
-def parse_release_file(path):
+def parse_release_text(text):
     values = {}
-    for line in path.read_text().splitlines():
+    for line in text.splitlines():
         if "=" in line and not line.startswith("#"):
             key, value = line.split("=", 1)
             values[key] = value.strip().strip('"')
@@ -446,10 +422,8 @@ def embedded_update_policy(kind, image):
         fail(f"invalid extension image name: {image}")
     name, _ = parsed
     location = "usr/lib" if kind == "sysext" else "etc"
-    with image_tree(image) as tree:
-        metadata = parse_release_file(
-            tree / location / "extension-release.d" / f"extension-release.{name}"
-        )
+    metadata = parse_release_text(read_image_metadata(
+        image, f"{location}/extension-release.d/extension-release.{name}"))
     level = "SYSEXT_LEVEL" if kind == "sysext" else "CONFEXT_LEVEL"
     if metadata.get("ID") == "_any":
         updates = "any"
@@ -460,6 +434,28 @@ def embedded_update_policy(kind, image):
     else:
         fail(f"extension has no systemd compatibility policy: {image}")
     return updates, metadata.get("VERSION_ID")
+
+
+def read_image_metadata(image, relative):
+    """Extract release metadata"""
+    partitions = gpt_partitions(image)
+    if not partitions or "extkit-root" not in partitions:
+        fail("expected an ExtKit GPT extension image")
+    work = STATE / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="extkit-metadata-", dir=work) as directory:
+        metadata = Path(directory) / "release"
+        subprocess.run([
+            EROFS_FSCK_TOOL, f"--offset={partitions['extkit-root']['offset']}",
+            f"--path=/{relative}", f"--extract={metadata}", "--no-preserve", str(image),
+        ], check=True, capture_output=True, text=True)
+        if metadata.is_symlink() or not metadata.is_file():
+            fail("extension release metadata must be a regular file")
+        with metadata.open("rb") as stream:
+            data = stream.read(64 * 1024 + 1)
+        if len(data) > 64 * 1024:
+            fail("extension release metadata exceeds 64 KiB")
+        return data.decode("utf-8")
 
 
 def policy_description(updates, version_id=None):
@@ -562,9 +558,10 @@ def command_diff(args):
             try:
                 show_diff(base, relative_path(path, args.kind))
             except ValueError as exc:
-                print(f"Skipped {path}: {exc}", file=sys.stderr)
+                print(f"Skipped {path}: {exc}", file=sys.stderr, color="yellow")
 
 
+@state_transaction
 def command_stage(args):
     paths = select_paths(args.paths, changed_paths(args.kind), "changed")
     deletions = set(load_deletions())
@@ -587,11 +584,12 @@ def command_stage(args):
         staged += 1
     save_selection(selection)
     save_deletions(deletions)
-    print(f"Staged {staged} path(s); {len(selection) + len(deletions)} total. Content will be read at build time")
+    print(f"Staged {staged} path(s); {len(selection) + len(deletions)} total. Content will be read at build time", color="green")
     for path, exc in skipped:
-        print(f"Skipped {path}: {exc}", file=sys.stderr)
+        print(f"Skipped {path}: {exc}", file=sys.stderr, color="yellow")
 
 
+@state_transaction
 def command_unstage(args):
     selection = set(load_selection())
     deletions = set(load_deletions())
@@ -681,9 +679,9 @@ def command_status(args):
             try:
                 updates, version_id = embedded_update_policy(kind, image)
             except (OSError, ValueError, subprocess.CalledProcessError) as error:
-                print(f"      {image.name}: unreadable; {error}")
-                continue
-            policy = policy_description(updates, version_id)
+                policy = f"unknown (metadata unreadable: {error})"
+            else:
+                policy = policy_description(updates, version_id)
             signature, trust, _ = signature_status(image)
             policy += f"; signature: {signature}; trust: {trust}"
             if selected:
@@ -823,9 +821,7 @@ def signature_status(image, verify=True):
         return "signed", "unchecked", "signature present"
     if os.geteuid() != 0:
         return "signed", "unknown (run as root)", "kernel verification requires root"
-    environment = os.environ.copy()
-    environment.update({"SYSTEMD_ALLOW_USERSPACE_VERITY": "0",
-                        "SYSTEMD_DISSECT_VERITY_SIGNATURE": "1", "SYSTEMD_DISSECT_VERITY_SIDECAR": "0"})
+    environment = verification_environment()
     try:
         result = subprocess.run(["systemd-dissect", "--read-only", f"--image-policy={SIGNED_POLICY}",
                                  "--with", str(image), "/usr/bin/true"],
@@ -1021,7 +1017,7 @@ def install_returned_extension(image, request, returned):
         os.close(descriptor)
 
 
-def phone_sign_images(outputs, name, version, enabled):
+def phone_sign_images(outputs, enabled):
     sign_image_batch([(kind, output, enabled[kind]) for kind, output in outputs.items()])
 
 
@@ -1033,7 +1029,7 @@ def sign_image_batch(targets):
     try:
         subprocess.run([PHONE_TOOL, "send", *requests, "--kind", "extension"], check=True)
     except (OSError, subprocess.CalledProcessError) as error:
-        print(f"Warning: batch signing did not fully complete: {error}. Checking returned images.", file=sys.stderr)
+        print(f"Warning: batch signing did not fully complete: {error}. Checking returned images.", file=sys.stderr, color="yellow")
     for kind, output, was_enabled in targets:
         name, _ = split_image_name(output)
         signing_request = output.with_suffix(".extsign")
@@ -1042,17 +1038,18 @@ def sign_image_batch(targets):
                                        output.with_suffix(".signed.raw"))
             if was_enabled:
                 enable_image(kind, name, output)
-            print(f"Stored signed {kind} image: {output}")
+            print(f"Stored signed {kind} image: {output}", color="green")
         except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
             _, image_version = split_image_name(output)
             print(f"Signing failed: {error}. Image and request retained. "
                   f"Retry: extkit sign {name} {image_version} --type {kind}",
-                  file=sys.stderr)
+                  file=sys.stderr, color="red")
             failures.append(output)
     if failures:
         fail("phone signing did not complete for all built images")
 
 
+@state_transaction
 def command_sign(args):
     if getattr(args, "untrusted", False) and os.geteuid() != 0:
         fail("sign --untrusted requires root to test kernel trust")
@@ -1070,13 +1067,7 @@ def command_sign(args):
     for kind, image in targets:
         name, version = split_image_name(image)
         request = image.with_suffix(".extsign")
-        if gpt_partitions(image) is None:
-            with tempfile.TemporaryDirectory(prefix=".extkit-ddi-", dir=image.parent) as work:
-                draft = Path(work) / "image.raw"
-                prepare_ddi(image, draft, request, name, version, kind)
-                draft.replace(image)
-        else:
-            ddi_request(image, request, name, version, kind)
+        ddi_request(image, request, name, version, kind)
         link = enabled_dir(kind) / f"{name}.raw"
         enabled.append((kind, image, link.is_symlink() and link.resolve() == image.resolve()))
     sign_image_batch(enabled)
@@ -1121,7 +1112,7 @@ def quarantine_extension(path, kind, reason):
             shutil.move(str(entry), str(slot / "entry"))
         except OSError as error:
             fail(f"cannot quarantine {entry}; refusing extension merge: {error}")
-        print(f"WARNING: Quarantined {entry}: {reason}", file=sys.stderr)
+        print(f"WARNING: Quarantined {entry}: {reason}", file=sys.stderr, color="yellow")
 
 
 def print_quarantine(kind=None):
@@ -1135,7 +1126,7 @@ def print_quarantine(kind=None):
             if kind is None or record.get("kind") == kind:
                 records.append((slot, record))
         except (OSError, ValueError):
-            print(f"  quarantine: unreadable record at {slot}")
+            print(f"  quarantine: unreadable record at {slot}", color="yellow")
     print("  quarantine:" if records else "  quarantine: none")
     for slot, record in records:
         print(f"    {record['kind']}/{record['name']}: {record['reason']}\n"
@@ -1160,6 +1151,7 @@ def authenticate_extension_or_quarantine(path, kind, environment):
     return True
 
 
+@state_transaction
 def command_boot_check(args):
     # Both services scan shared discovery paths; serialize quarantine and sync
     # so they cannot race while moving the same malicious entry.
@@ -1174,12 +1166,7 @@ def command_boot_check(args):
 def boot_check_locked(args):
     """Boot prerequisite: no directory images, kernel-authenticated DDIs."""
     loader = "systemd-sysext" if args.kind == "sysext" else "systemd-confext"
-    environment = os.environ.copy()
-    environment.update({
-        "SYSTEMD_ALLOW_USERSPACE_VERITY": "0",
-        "SYSTEMD_DISSECT_VERITY_SIGNATURE": "1",
-        "SYSTEMD_DISSECT_VERITY_SIDECAR": "0",
-    })
+    environment = verification_environment()
     if args.kind == "sysext":
         environment["SYSTEMD_SYSEXT_HIERARCHIES"] = ":".join(
             "/" + hierarchy for hierarchy in KINDS["sysext"])
@@ -1234,13 +1221,13 @@ def warn_if_signing_key_unenrolled():
              "Continuing extension creation, but boot-time verification will reject "
              "images signed by an untrusted key. Run 'extkit-phone setup' and reboot. "
              "If boot.img is already personalized, reboot to load its key. "
-             f"({error})", file=sys.stderr)
+             f"({error})", file=sys.stderr, color="yellow")
 
 
 def offer_build_signing(outputs, name, version, enabled, no_sign=False):
     print("WARNING: These images cannot be loaded under the signed-image policy until "
           "they are signed by a trusted key. Their contents take effect only after "
-          "the extensions are enabled and merged (mounted).", file=sys.stderr)
+          "the extensions are enabled and merged (mounted).", file=sys.stderr, color="yellow")
     sign_now = False
     if not no_sign:
         while True:
@@ -1254,15 +1241,16 @@ def offer_build_signing(outputs, name, version, enabled, no_sign=False):
             if answer in ("y", "yes", "now"):
                 sign_now = True
                 break
-            print("Enter y to sign now, or n to sign later.")
+            print("Enter y to sign now, or n to sign later.", color="yellow")
     if sign_now:
-        phone_sign_images(outputs, name, version, enabled)
+        phone_sign_images(outputs, enabled)
     else:
         print("Signing deferred. Images and signing requests have been retained.")
         for kind in outputs:
             print(f"Sign later: extkit sign {name} {version} --type {kind}")
 
 
+@state_transaction
 def command_build(args):
     checked_name(args.name)
     warn_if_signing_key_unenrolled()
@@ -1326,26 +1314,19 @@ def command_build(args):
             drafts[kind] = draft
         for kind, output in outputs.items():
             output.parent.mkdir(parents=True, exist_ok=True)
-            if PHONE_SIGNING:
-                ddi = Path(work) / f"{kind}-ddi.raw"
-                prepare_ddi(drafts[kind], ddi, output.with_suffix(".extsign"),
-                            args.name, str(version), kind)
-                drafts[kind] = ddi
+            ddi = Path(work) / f"{kind}-ddi.raw"
+            prepare_ddi(drafts[kind], ddi, output.with_suffix(".extsign"),
+                        args.name, str(version), kind)
+            drafts[kind] = ddi
             drafts[kind].replace(output)
         for kind, output in outputs.items():
-            if previously_enabled[kind] and not PHONE_SIGNING:
-                enable_image(kind, args.name, output)
-                state = "enabled"
-            else:
-                state = "disabled"
-            print(f"Built unsigned {state} {kind} image: {output}")
+            print(f"Built unsigned disabled {kind} image: {output}", color="green")
     built = {"/" + str(path) for paths in grouped.values() for path in paths}
     built_deletions = {"/" + str(path) for paths in grouped_deletions.values() for path in paths}
     save_selection(set(selection) - built)
     save_deletions(set(deletions) - built_deletions)
-    if PHONE_SIGNING:
-        offer_build_signing(outputs, args.name, str(version), previously_enabled,
-                            no_sign=getattr(args, "no_sign", False))
+    offer_build_signing(outputs, args.name, str(version), previously_enabled,
+                        no_sign=getattr(args, "no_sign", False))
 
 
 def command_list(args):
@@ -1386,6 +1367,7 @@ def enable_image(kind, name, image):
     return link
 
 
+@state_transaction
 def command_enable(args):
     if args.name == "*":
         if args.version is not None:
@@ -1410,15 +1392,16 @@ def command_enable(args):
             fail("no disabled extensions found")
         for kind, name, image in candidates:
             link = enable_image(kind, name, image)
-            print(f"Enabled on next boot: {link} -> {image}")
+            print(f"Enabled on next boot: {link} -> {image}", color="green")
         return
     checked_name(args.name)
     candidates = requested_images(args.name, args.version, args.kind)
     for kind, image in candidates:
         link = enable_image(kind, args.name, image)
-        print(f"Enabled on next boot: {link} -> {image}")
+        print(f"Enabled on next boot: {link} -> {image}", color="green")
 
 
+@state_transaction
 def command_disable(args):
     if args.name == "*":
         candidates = []
@@ -1431,7 +1414,7 @@ def command_disable(args):
             fail("no managed enabled extensions found")
         for kind, link in candidates:
             link.unlink()
-            print(f"Disabled on next boot: {kind}/{link.stem}")
+            print(f"Disabled on next boot: {kind}/{link.stem}", color="green")
         return
     checked_name(args.name)
     candidates = []
@@ -1443,9 +1426,10 @@ def command_disable(args):
         fail(f"no managed enabled images for {args.name}")
     for kind, link in candidates:
         link.unlink()
-        print(f"Disabled on next boot: {kind}/{args.name}")
+        print(f"Disabled on next boot: {kind}/{args.name}", color="green")
 
 
+@state_transaction
 def command_policy(args):
     checked_name(args.name)
     warn_if_signing_key_unenrolled()
@@ -1482,22 +1466,19 @@ def command_policy(args):
         for kind, draft in drafts.items():
             output = store_dir(kind) / f"{args.name}_{version}.raw"
             output.parent.mkdir(parents=True, exist_ok=True)
-            if PHONE_SIGNING:
-                ddi = Path(work) / f"{kind}-ddi.raw"
-                prepare_ddi(draft, ddi, output.with_suffix(".extsign"),
-                            args.name, str(version), kind)
-                draft = ddi
+            ddi = Path(work) / f"{kind}-ddi.raw"
+            prepare_ddi(draft, ddi, output.with_suffix(".extsign"),
+                        args.name, str(version), kind)
+            draft = ddi
             draft.replace(output)
-            if enabled[kind] and not PHONE_SIGNING:
-                enable_image(kind, args.name, output)
-            print(f"Rebuilt {kind} policy as {args.updates}: {output}")
-        if PHONE_SIGNING:
-            phone_sign_images(
-                {kind: store_dir(kind) / f"{args.name}_{version}.raw" for kind in drafts},
-                args.name, str(version), enabled,
-            )
+            print(f"Rebuilt {kind} policy as {args.updates}: {output}", color="green")
+        offer_build_signing(
+            {kind: store_dir(kind) / f"{args.name}_{version}.raw" for kind in drafts},
+            args.name, str(version), enabled,
+        )
 
 
+@state_transaction
 def command_sync(args):
     """Synchronize enabled images into systemd's runtime discovery directory."""
     kind = args.kind
@@ -1519,8 +1500,8 @@ def command_sync(args):
     source = enabled_dir(kind)
     if getattr(args, "boot", False) and source.is_dir():
         for entry in source.iterdir():
-                if entry.is_dir():
-                    quarantine_extension(entry, kind, "directory/subvolume extension")
+            if entry.is_dir():
+                quarantine_extension(entry, kind, "directory/subvolume extension")
     for link in sorted(source.glob("*.raw")) if source.exists() else []:
         if not link.is_symlink() or not link.resolve().is_relative_to(store_dir(kind)):
             continue
@@ -1702,7 +1683,7 @@ def main():
             print()
             parser.print_help()
     except (ValueError, OSError, subprocess.CalledProcessError, KeyError, configparser.Error) as exc:
-        print(f"extkit: {exc}", file=sys.stderr)
+        print(f"extkit: {exc}", file=sys.stderr, color="red")
         raise SystemExit(1)
 
 
