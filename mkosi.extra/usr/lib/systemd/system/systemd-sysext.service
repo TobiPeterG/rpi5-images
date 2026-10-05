@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: LGPL-2.1-or-later
+# Full unit replacement: ordering dependencies cannot be cleared in drop-ins.
+# /var is an extension hierarchy, so merge before /var/log and local-fs.target.
+[Unit]
+Description=Merge System Extension Images into /usr/, /opt/, and /var/
+Documentation=man:systemd-sysext.service(8)
+ConditionCapability=CAP_SYS_ADMIN
+ConditionDirectoryNotEmpty=|/.state/extensions
+ConditionPathExists=!/etc/initrd-release
+ConditionKernelCommandLine=!systemd.sysext=0
+DefaultDependencies=no
+RequiresMountsFor=/.state
+Before=var-log.mount local-fs.target sysinit.target systemd-tmpfiles-setup.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=+/usr/bin/install -d -m 0700 /run/extensions.mutable
+ExecStart=systemd-sysext refresh
+ExecReload=systemd-sysext refresh
+ExecStop=systemd-sysext unmerge
+
+[Install]
+WantedBy=sysinit.target

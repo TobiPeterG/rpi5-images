@@ -5,7 +5,6 @@ import argparse
 import base64
 import fcntl
 import configparser
-import glob
 import hashlib
 import json
 import os
@@ -24,7 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib/extkit"))
-from common import print
+from common import print, efi_x509_certificates, enrolled_certificates
+import addons
 PROTOCOL = "org.extkit.signing-network.v1"
 BINDING_DOMAIN = b"org.extkit.transport-binding.v1\n"
 PAIRING_DOMAIN = b"org.extkit.pairing.v1\0"
@@ -215,41 +215,6 @@ def exchange(service, request, payload=None, output=None, timeout=10, expected_p
                     progress.finish()
                 body = None
             return response, body, peer
-
-
-def efi_x509_certificates(data, owner_guid=None):
-    """Return DER certificates from an EFI signature-list payload."""
-    certificates = []
-    position = 0
-    while position + 28 <= len(data):
-        signature_type = uuid.UUID(bytes_le=data[position:position + 16])
-        list_size, header_size, signature_size = struct.unpack_from("<III", data, position + 16)
-        if list_size < 28 or position + list_size > len(data) or signature_size < 16:
-            break
-        entries = position + 28 + header_size
-        end = position + list_size
-        if entries > end or (end - entries) % signature_size:
-            break
-        if signature_type == EFI_CERT_X509_GUID:
-            while entries + signature_size <= end:
-                owner = uuid.UUID(bytes_le=data[entries:entries + 16])
-                if owner_guid is None or owner == owner_guid:
-                    certificates.append(data[entries + 16:entries + signature_size])
-                entries += signature_size
-        position = end
-    return certificates
-
-
-def enrolled_certificates(pattern, owner_guid=None):
-    certificates = []
-    for name in glob.glob(pattern):
-        try:
-            data = Path(name).read_bytes()
-        except OSError:
-            continue
-        # efivarfs prefixes variable data with the four-byte EFI attributes.
-        certificates.extend(efi_x509_certificates(data[4:], owner_guid))
-    return certificates
 
 
 def binding_payload(transport_fingerprint):
@@ -522,6 +487,8 @@ def submit_request(phone, token, source, kind, output, config, wait=True):
     source = Path(source)
     if not source.is_file():
         fail(f"input file does not exist: {source}")
+    if kind == "addon" and output is None:
+        fail("addon requests require --output; use extkit addon sign to install them")
     if kind == "boot" and output is None:
         boot_directory = config["boot_directory"]
         # Trigger a systemd automount before checking the actual mount.
@@ -646,7 +613,31 @@ def send_batch(phone, token, inputs, config):
 
 
 def receive_results(phone, token, job_id, source, kind, output, config):
-    if kind == "extension":
+    if kind == "addon":
+        if output is None:
+            fail("addon requests require --output; extkit handles ESP activation")
+        destination = Path(output)
+        with tempfile.TemporaryDirectory(prefix="extkit-addon-result-") as temporary:
+            image = Path(temporary) / "addon.efi"
+            save_artifact(phone, token, job_id, "addon.efi", image, config)
+            if not addons.verify(image, [base64.b64decode(phone.info["extensionCertificate"], validate=True)]):
+                fail("returned addon signature is not from the authenticated phone")
+            import zipfile
+            with zipfile.ZipFile(source) as archive:
+                original = archive.read("addon.efi")
+            if addons.inspect(original)[:2] != addons.inspect(image.read_bytes())[:2]:
+                fail("returned addon content differs from the submitted request")
+            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=".addon-", delete=False) as stream:
+                pending = Path(stream.name)
+                try:
+                    stream.write(image.read_bytes())
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    pending.replace(destination)
+                finally:
+                    pending.unlink(missing_ok=True)
+        print(f"Stored signed addon: {destination}", color="green")
+    elif kind == "extension":
         destination = Path(output) if output else source.with_suffix(".signed.raw")
         save_artifact(phone, token, job_id, "extension.raw", destination, config)
         print(f"Saved {destination}", color="green")
@@ -792,7 +783,7 @@ def command_send(args, config):
         token = pair(phone, config)
     inputs = args.input
     if len(inputs) > 1:
-        if args.output is not None or args.kind == "boot" or any(not str(path).endswith(".extsign") for path in inputs):
+        if args.output is not None or args.kind not in ("auto", "extension") or any(not str(path).endswith(".extsign") for path in inputs):
             fail("batch sending accepts only .extsign extension requests and no --output")
         if len(set(map(str, inputs))) != len(inputs):
             fail("batch contains duplicate request paths")
@@ -802,7 +793,7 @@ def command_send(args, config):
     args.input = inputs[0]
     kind = args.kind
     if kind == "auto":
-        kind = "extension" if str(args.input).endswith(".extsign") else "boot"
+        kind = "addon" if str(args.input).endswith(".addonsign") else "extension" if str(args.input).endswith(".extsign") else "boot"
     while True:
         try:
             send_request(phone, token, args.input, kind, args.output, config)
@@ -828,10 +819,10 @@ def main(argv=None):
     enrollment = commands.add_parser("check-enrollment", help="check for a user key in the live Secure Boot db")
     enrollment.add_argument("--quiet", action="store_true")
     commands.add_parser("setup", help="set up phone signing if no user key is enrolled")
-    send = commands.add_parser("send", help="send an extension or boot signing request for on-phone review")
-    send.add_argument("input", nargs="+", help="one boot.img/.bootsign, or one or more .extsign requests")
-    send.add_argument("--kind", choices=("auto", "extension", "boot"), default="auto")
-    send.add_argument("--output", help="finished GPT image path for extensions; save boot files here instead of installing them on the boot partition")
+    send = commands.add_parser("send", help="send an extension, UKI addon or boot signing request for on-phone review")
+    send.add_argument("input", nargs="+", help="one boot.img/.bootsign/.addonsign, or one or more .extsign requests")
+    send.add_argument("--kind", choices=("auto", "extension", "boot", "addon"), default="auto")
+    send.add_argument("--output", help="destination for the signed extension or addon; directory for boot files instead of installing them on the boot partition")
     args = parser.parse_args(argv)
     config = load_config(args.config)
     if args.command == "discover":

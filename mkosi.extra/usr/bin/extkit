@@ -31,6 +31,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib/extkit"))
 from common import print, load_path_list, save_path_list, locked_state, verification_environment
+from common import enrolled_certificates
+import addons
 
 STATE = None
 ROOT = None
@@ -46,6 +48,7 @@ EROFS_FSCK_TOOL = None
 PHONE_TOOL = None
 REPART_TOOL = None
 BOOT_SETTINGS = None
+ADDON_SETTINGS = {}
 KINDS = {}
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.-]*\Z")
 EXCLUDED_TREES = ()
@@ -73,12 +76,13 @@ def configure(path):
     global STATE, ROOT, BASE_DIRECTORY, BASE_DEVICE, BASE_FSTYPE, OVERLAY_UPPERS
     global RUNTIME_DIRECTORY, ENABLED_DIRS, RUNTIME_DIRS, EROFS_TOOL, EROFS_FSCK_TOOL
     global KINDS, EXCLUDED_TREES, PHONE_TOOL, REPART_TOOL
-    global BOOT_SETTINGS
+    global BOOT_SETTINGS, ADDON_SETTINGS
     config = configparser.ConfigParser(interpolation=None)
     if not config.read(path):
         fail(f"configuration file not found: {path}")
     paths = config["Paths"]
     BOOT_SETTINGS = dict(config["BootUpdates"]) if config.has_section("BootUpdates") else None
+    ADDON_SETTINGS = dict(config["Addons"]) if config.has_section("Addons") else {}
     STATE = Path(paths["StateDirectory"])
     ROOT = Path(paths["RootDirectory"])
     OVERLAY_UPPERS = []
@@ -1617,6 +1621,112 @@ def command_compare(args):
             show_image_difference(old_tree, new_tree, old.name, new.name)
 
 
+def addon_versions(name):
+    checked_name(name)
+    directory = STATE / "store/addon"
+    pattern = re.compile(re.escape(name) + r"_([1-9][0-9]*)\.addon\.efi\Z")
+    return {int(match[1]): path for path in directory.glob(f"{name}_*.addon.efi")
+            if (match := pattern.fullmatch(path.name))}
+
+
+def selected_addon(args):
+    versions = addon_versions(args.name)
+    version = int(args.version) if getattr(args, "version", None) else max(versions, default=0)
+    if version not in versions:
+        fail("addon version not found")
+    return versions[version]
+
+
+def addon_boot_directory():
+    directory = Path(ADDON_SETTINGS.get("bootdirectory", "/boot"))
+    if not directory.is_absolute():
+        fail("addon BootDirectory must be absolute")
+    directory.stat()  # Trigger the ESP automount.
+    if not os.path.ismount(directory):
+        fail(f"ESP is not mounted at {directory}")
+    return directory / "loader/addons"
+
+
+def addon_certificates():
+    return enrolled_certificates(ADDON_SETTINGS.get("uefidbglob", "/sys/firmware/efi/efivars/db-*"))
+
+
+def sign_addon(image, enable=True):
+    name, version = image.name.removesuffix(".addon.efi").rsplit("_", 1)
+    payload = image.with_name(image.name.removesuffix(".addon.efi") + ".addonsign")
+    if not addons.inspect(image.read_bytes())[2]:
+        addons.request(image, payload, name, version)
+        subprocess.run([PHONE_TOOL, "send", str(payload), "--kind", "addon", "--output", str(image)], check=True)
+    if not addons.verify(image, addon_certificates()):
+        print("WARNING: Signed addon retained, but its key is not trusted by the live Secure Boot db. "
+              "Enroll the phone key and reboot, then run extkit addon enable " + name, color="yellow")
+        return
+    if enable:
+        installed = addons.install(image, addon_boot_directory(), name, addon_certificates())
+        print(f"Enabled addon for next boot: {installed}", color="green")
+
+
+@state_transaction
+def command_addon(args):
+    action = args.action
+    if action == "build":
+        checked_name(args.name)
+        if len(args.name) > 128:
+            fail("addon name must not exceed 128 characters")
+        command_line = args.cmdline
+        if args.machine_id is not None:
+            identity = (ROOT / "etc/machine-id").read_text().strip() if args.machine_id == "current" else args.machine_id
+            if not re.fullmatch(r"[0-9a-f]{32}", identity) or identity == "0" * 32:
+                fail("machine ID must be 32 lowercase hexadecimal digits and nonzero")
+            command_line = "systemd.machine_id=" + identity
+        architecture = args.architecture or ADDON_SETTINGS.get("architecture")
+        if architecture is None:
+            architecture = {"aarch64": "arm64", "x86_64": "x86-64"}.get(os.uname().machine)
+        data = addons.build(command_line, architecture)
+        version = max(addon_versions(args.name), default=0) + 1
+        directory = STATE / "store/addon"
+        directory.mkdir(parents=True, exist_ok=True)
+        image = directory / f"{args.name}_{version}.addon.efi"
+        with image.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        addons.request(image, image.with_name(f"{args.name}_{version}.addonsign"), args.name, version)
+        print(f"Built unsigned addon: {image}\nCommand line: {command_line}", color="green")
+        if args.no_sign:
+            print(f"WARNING: Not usable until signed. Run extkit addon sign {args.name} {version}.", color="yellow")
+        elif input("Sign on the phone and install for next boot now? [Y/n] ").strip().lower() in ("", "y", "yes"):
+            warn_if_signing_key_unenrolled()
+            sign_addon(image)
+    elif action == "sign":
+        warn_if_signing_key_unenrolled()
+        sign_addon(selected_addon(args), enable=not args.no_enable)
+    elif action == "enable":
+        image = selected_addon(args)
+        installed = addons.install(image, addon_boot_directory(), args.name, addon_certificates())
+        print(f"Enabled addon for next boot: {installed}", color="green")
+    elif action == "disable":
+        checked_name(args.name)
+        path = addon_boot_directory() / f"{args.name}.addon.efi"
+        path.unlink(missing_ok=True)
+        os.sync()
+        print(f"Disabled addon for next boot: {args.name}", color="green")
+    elif action == "inspect":
+        image = selected_addon(args)
+        command_line, architecture, signed = addons.inspect(image.read_bytes())
+        print(f"{image.name}: {architecture}; signature: {'signed' if signed else 'unsigned'}\n{command_line}")
+    elif action == "list":
+        for image in sorted((STATE / "store/addon").glob("*.addon.efi")):
+            command_line, architecture, signed = addons.inspect(image.read_bytes())
+            trusted = addons.verify(image, addon_certificates()) if signed else False
+            name = image.name.removesuffix(".addon.efi").rsplit("_", 1)[0]
+            active = Path(ADDON_SETTINGS.get("bootdirectory", "/boot")) / "loader/addons" / f"{name}.addon.efi"
+            enabled = active.is_file() and active.read_bytes() == image.read_bytes()
+            print(f"{image.name}: {architecture}; signature: {'signed' if signed else 'unsigned'}; "
+                  f"trust: {'trusted' if trusted else 'not trusted'}; "
+                  f"{'enabled for boot' if enabled else 'disabled'}\n  {command_line}")
+
+
 def main():
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=Path, default=Path("/etc/extkit.conf"))
@@ -1658,6 +1768,23 @@ def main():
     sub.add_parser("boot-update-check", help="show factory boot images staged by systemd-sysupdate")
     boot_update = sub.add_parser("boot-update", help="verify and send a staged factory boot image for phone signing")
     boot_update.add_argument("version", nargs="?", help="staged version; defaults to newest update")
+    addon = sub.add_parser("addon", help="build, phone-sign and install command-line UKI addons")
+    actions = addon.add_subparsers(dest="action", required=True)
+    build = actions.add_parser("build")
+    build.add_argument("name")
+    content = build.add_mutually_exclusive_group(required=True)
+    content.add_argument("--cmdline", help="exact additional kernel command-line parameters")
+    content.add_argument("--machine-id", nargs="?", const="current", help="persist this ID; defaults to live /etc/machine-id")
+    build.add_argument("--architecture", choices=addons.MACHINES)
+    build.add_argument("--no-sign", action="store_true")
+    for action in ("sign", "enable", "inspect"):
+        item = actions.add_parser(action)
+        item.add_argument("name")
+        item.add_argument("version", nargs="?")
+        if action == "sign":
+            item.add_argument("--no-enable", action="store_true")
+    actions.add_parser("disable").add_argument("name")
+    actions.add_parser("list")
     args = parser.parse_args()
     show_help_after_status = args.command is None
     if show_help_after_status:
