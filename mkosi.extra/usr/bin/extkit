@@ -697,6 +697,9 @@ def command_status(args):
                 )
             else:
                 print(f"      {image.name}: disabled; updates: {policy}")
+    if args.kind is None:
+        print("UKI addons:")
+        print_addon_status(indent="  ")
     if BOOT_SETTINGS is not None and args.kind is None:
         command_boot_update_check(args)
 
@@ -1716,15 +1719,27 @@ def command_addon(args):
         command_line, architecture, signed = addons.inspect(image.read_bytes())
         print(f"{image.name}: {architecture}; signature: {'signed' if signed else 'unsigned'}\n{command_line}")
     elif action == "list":
-        for image in sorted((STATE / "store/addon").glob("*.addon.efi")):
+        print_addon_status()
+
+
+def print_addon_status(indent=""):
+    images = sorted((STATE / "store/addon").glob("*.addon.efi"))
+    if not images:
+        print(f"{indent}none")
+        return
+    certificates = addon_certificates()
+    for image in images:
+        try:
             command_line, architecture, signed = addons.inspect(image.read_bytes())
-            trusted = addons.verify(image, addon_certificates()) if signed else False
+            trusted = addons.verify(image, certificates) if signed else False
             name = image.name.removesuffix(".addon.efi").rsplit("_", 1)[0]
             active = Path(ADDON_SETTINGS.get("bootdirectory", "/boot")) / "loader/addons" / f"{name}.addon.efi"
             enabled = active.is_file() and active.read_bytes() == image.read_bytes()
-            print(f"{image.name}: {architecture}; signature: {'signed' if signed else 'unsigned'}; "
+            print(f"{indent}{image.name}: {architecture}; signature: {'signed' if signed else 'unsigned'}; "
                   f"trust: {'trusted' if trusted else 'not trusted'}; "
-                  f"{'enabled for boot' if enabled else 'disabled'}\n  {command_line}")
+                  f"{'enabled for boot' if enabled else 'disabled'}\n{indent}  {command_line}")
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(f"{indent}{image.name}: cannot inspect: {error}", color="yellow")
 
 
 def main():
