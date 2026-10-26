@@ -1,13 +1,18 @@
 """command-line UKI addons"""
+
 import hashlib
 import json
-import os
-from pathlib import Path
 import re
 import struct
-import subprocess
 import tempfile
 import zipfile
+from pathlib import Path
+
+from . import filesystem
+from . import process
+from .crypto import certificate_pem
+from .errors import ArtifactFormatError
+
 
 FORMAT = "org.extkit.addon-request.v1"
 MAX_SIZE = 64 * 1024
@@ -20,9 +25,9 @@ CODE = {"arm64": bytes.fromhex("600080d20000f0f2c0035fd6"),
 
 def build(command_line, architecture):
     if architecture not in MACHINES:
-        raise ValueError("addon architecture must be arm64 or x86-64")
+        raise ArtifactFormatError("addon architecture must be arm64 or x86-64")
     if not command_line or len(command_line.encode()) > 8192 or any(ord(c) < 32 or ord(c) > 126 for c in command_line):
-        raise ValueError("addon command line must contain 1–8192 printable ASCII bytes")
+        raise ArtifactFormatError("addon command line must contain 1–8192 printable ASCII bytes")
     sections = [(b".text", CODE[architecture], 0x60000020),
                 (b".cmdline", command_line.encode() + b"\0", 0x40000040),
                 (b".sbat", SBAT, 0x40000040)]
@@ -55,32 +60,32 @@ def build(command_line, architecture):
 
 def inspect(data):
     if not 512 <= len(data) <= MAX_SIZE or data[:2] != b"MZ" or data[64:68] != b"PE\0\0":
-        raise ValueError("invalid addon PE image")
+        raise ArtifactFormatError("invalid addon PE image")
     architecture = next((key for key, value in MACHINES.items() if struct.unpack_from("<H", data, 68)[0] == value), None)
     if architecture is None:
-        raise ValueError("unsupported addon architecture")
+        raise ArtifactFormatError("unsupported addon architecture")
     size, _, raw_size, offset = struct.unpack_from("<IIII", data, 368 + 8)
     if not 1 < size <= 8193 or raw_size < size or offset < 512 or offset + raw_size > len(data):
-        raise ValueError("invalid addon command-line section")
+        raise ArtifactFormatError("invalid addon command-line section")
     payload = data[offset:offset + size]
     if payload[-1:] != b"\0":
-        raise ValueError("unterminated addon command line")
+        raise ArtifactFormatError("unterminated addon command line")
     command_line = payload[:-1].decode("ascii")
     canonical = build(command_line, architecture)
     normalized = bytearray(data[:len(canonical)])
     normalized[152:156] = bytes(4)  # PE checksum, not part of Authenticode.
     normalized[232:240] = bytes(8)  # Certificate table.
     if bytes(normalized) != canonical:
-        raise ValueError("addon contains unexpected headers, sections or executable code")
+        raise ArtifactFormatError("addon contains unexpected headers, sections or executable code")
     cert_offset, cert_size = struct.unpack_from("<II", data, 232)
     if cert_size:
         if cert_offset != len(canonical) or cert_offset + cert_size != len(data) or cert_size < 8:
-            raise ValueError("invalid addon certificate table")
+            raise ArtifactFormatError("invalid addon certificate table")
         length, revision, kind = struct.unpack_from("<IHH", data, cert_offset)
         if revision != 0x200 or kind != 2 or not 8 < length <= cert_size or any(data[cert_offset + length:]):
-            raise ValueError("invalid addon WIN_CERTIFICATE")
+            raise ArtifactFormatError("invalid addon WIN_CERTIFICATE")
     elif len(data) != len(canonical) or cert_offset:
-        raise ValueError("unsigned addon contains trailing data")
+        raise ArtifactFormatError("unsigned addon contains trailing data")
     return command_line, architecture, bool(cert_size)
 
 
@@ -88,7 +93,7 @@ def request(image, destination, name, version):
     data = image.read_bytes()
     command_line, architecture, signed = inspect(data)
     if signed:
-        raise ValueError("addon is already signed")
+        raise ArtifactFormatError("addon is already signed")
     metadata = {"format": FORMAT, "name": name, "version": str(version),
                 "architecture": architecture, "imageSha256": hashlib.sha256(data).hexdigest()}
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_STORED) as archive:
@@ -102,12 +107,9 @@ def verify(image, certificates):
     if not signed:
         return False
     with tempfile.TemporaryDirectory(prefix="extkit-addon-verify-") as work:
-        der, pem = Path(work) / "certificate.der", Path(work) / "certificate.pem"
         for certificate in certificates:
-            der.write_bytes(certificate)
-            subprocess.run(["openssl", "x509", "-inform", "DER", "-in", str(der), "-out", str(pem)],
-                           check=True, capture_output=True)
-            result = subprocess.run(["sbverify", "--cert", str(pem), str(image)], capture_output=True)
+            pem = certificate_pem(Path(work), certificate)
+            result = process.run(["sbverify", "--cert", str(pem), str(image)], capture_output=True)
             if result.returncode == 0:
                 return True
     return False
@@ -115,23 +117,10 @@ def verify(image, certificates):
 
 def install(image, directory, name, certificates):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", name):
-        raise ValueError("invalid addon name")
+        raise ArtifactFormatError("invalid addon name")
     if not verify(image, certificates):
-        raise ValueError("addon signature is not trusted by the live Secure Boot db; enroll its key and reboot")
+        raise ArtifactFormatError("addon signature is not trusted by the live Secure Boot db. Enroll its key and reboot")
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / f"{name}.addon.efi"
-    with tempfile.NamedTemporaryFile(dir=directory, prefix=".addon-", delete=False) as stream:
-        pending = Path(stream.name)
-        try:
-            stream.write(image.read_bytes())
-            stream.flush()
-            os.fsync(stream.fileno())
-            pending.replace(destination)
-            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        finally:
-            pending.unlink(missing_ok=True)
+    filesystem.atomic_copy(image, destination)
     return destination
