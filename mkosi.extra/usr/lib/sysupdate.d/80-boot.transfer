@@ -11,4 +11,4 @@ Type=regular-file
 Path=/.state/extkit/boot-updates
 MatchPattern=%M_@v_%a.boot.img
 Mode=0600
-InstancesMax=5
+InstancesMax=2
