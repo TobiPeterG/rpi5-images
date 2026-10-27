@@ -6,7 +6,7 @@ import tempfile
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import filesystem, images, metadata, overlay, process, signing, store, validation
+from . import filesystem, images, metadata, overlay, process, selinux, signing, store, validation
 from .config import ExtkitConfig
 from .console import print
 from .errors import InstallationError, PublicationError, fail
@@ -86,16 +86,38 @@ def _build(config: ExtkitConfig, args, policy_only=False):
             for kind in kinds:
                 tree = Path(work) / kind / 'tree'
                 tree.mkdir(parents=True)
-                if previous[kind]:
+                preserve = getattr(args, 'preserve_content_labels', False)
+                inherited_tree = Path(work) / kind / 'inherited'
+                if previous[kind] and preserve:
+                    inherited_tree.mkdir()
+                    images.copy_image_tree(config, previous[kind][max(previous[kind])], inherited_tree)
+                    for directory, names, _ in os.walk(inherited_tree, followlinks=False):
+                        for name in names:
+                            source = Path(directory) / name
+                            if not source.is_symlink():
+                                (tree / source.relative_to(inherited_tree)).mkdir(parents=True, exist_ok=True)
+                elif previous[kind]:
                     images.copy_image_tree(config, previous[kind][max(previous[kind])], tree)
+                metadata_dir = 'usr/lib' if kind == 'sysext' else 'etc'
+                metadata_file = tree / metadata_dir / 'extension-release.d' / f'extension-release.{args.name}'
+                if preserve:
+                    for relative in grouped[kind] + removals[kind]:
+                        (tree / relative).parent.mkdir(parents=True, exist_ok=True)
+                    metadata.release_metadata(config, tree, args.name, kind, str(version), policies[kind])
+                    selinux.label_paths(tree, [tree])
+                    if previous[kind]:
+                        process.run(['cp', '-a', f'{inherited_tree}/.', str(tree)], check=True)
                 for relative in grouped[kind]:
                     overlay.copy_selected(overlay.live_file(config, relative), tree / relative)
+                whiteouts = []
                 for relative in removals[kind]:
                     target = tree / relative
                     overlay.remove_path(target)
                     target.parent.mkdir(parents=True, exist_ok=True)
                     os.mknod(target, stat.S_IFCHR, os.makedev(0, 0))
+                    whiteouts.append(target)
                 metadata.release_metadata(config, tree, args.name, kind, str(version), policies[kind])
+                selinux.label_paths(tree, [metadata_file, *whiteouts] if preserve else [tree])
                 draft = Path(work) / f'{kind}.raw'
                 process.run([config.erofs_tool, str(draft), str(tree)], check=True)
                 drafts[kind] = draft

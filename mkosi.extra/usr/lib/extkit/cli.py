@@ -57,6 +57,9 @@ def main(argv=None):
         if command == "build":
             p.add_argument("--updates", choices=metadata.UPDATE_POLICIES)
             p.add_argument("--no-sign", action="store_true", help="prepare images now and sign them later with extkit sign")
+        if command in ("build", "policy"):
+            p.add_argument("--preserve-content-labels", action="store_true",
+                           help="keep SELinux labels on content files and symlinks")
     sub.add_parser("list").add_argument("--type", dest="kind", choices=('sysext', 'confext'))
     sub.add_parser("boot-update-check", help="show factory boot images staged by systemd-sysupdate")
     boot_update = sub.add_parser("boot-update", help="verify and send a staged factory boot image for phone signing")
