@@ -15,7 +15,7 @@ from .filesystem import locked_state
 
 
 def selection_file(config: ExtkitConfig):
-    return config.state / 'index.json'
+    return config.runtime_directory / 'extkit' / 'index.json'
 
 
 def load_index(config: ExtkitConfig):
@@ -48,7 +48,7 @@ def save_index(config: ExtkitConfig, selected, deleted):
 
 def reserve_version(config: ExtkitConfig, name):
     """Caller holds the state lock."""
-    directory = config.state / 'reservations'
+    directory = config.runtime_directory / 'extkit' / 'reservations'
     directory.mkdir(parents=True, exist_ok=True)
     versions = [number for kind in config.kinds for number in image_versions(config, kind, name)]
     for path in directory.glob(f'{name}_*.json'):
