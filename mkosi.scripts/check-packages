@@ -17,7 +17,7 @@ for image in (root / "mkosi.images").glob("*/mkosi.conf"):
     required |= packages(image)
 declared = packages(root / "mkosi.conf")
 # These filesystem tools are required by mkosi/OBS for disk construction.
-expected = required | {"e2fsprogs", "xfsprogs"}
+expected = required | {"e2fsprogs", "xfsprogs", "rpm-build", "xz"}
 if declared != expected:
     raise SystemExit(f"OBS package union mismatch: missing={sorted(expected - declared)}, "
                      f"unexpected={sorted(declared - expected)}")

@@ -1,0 +1,14 @@
+#!/usr/bin/bash
+set -euo pipefail
+case ${IMAGE_ID:?} in microos-rpi5|microos-rpi5ch) ;; *) echo "Unexpected image ID: ${IMAGE_ID}" >&2; exit 1 ;; esac
+level=${IMAGE_ID}-${IMAGE_VERSION:?}
+[[ ${level} =~ ^[a-z0-9._-]+$ ]] || { echo "Invalid extension compatibility level: ${level}" >&2; exit 1; }
+release=${BUILDROOT:?}/usr/lib/os-release
+[[ -s ${release} ]] || { echo "Image os-release missing" >&2; exit 1; }
+for file in "${release}" "${BUILDROOT}/etc/os-release"; do
+    [[ -f ${file} && ! -L ${file} ]] || continue
+    sed -i '/^SYSEXT_LEVEL=/d' "${file}"
+    printf 'SYSEXT_LEVEL="%s"\n' "${level}" >> "${file}"
+done
+split=${OUTPUTDIR:?}/${IMAGE_ID}_${IMAGE_VERSION}_${ARCHITECTURE:?}.osrelease
+[[ ! -f ${split} ]] || cp -- "${release}" "${split}"

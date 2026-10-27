@@ -6,6 +6,7 @@ set -euo pipefail
 # Build scripts do not receive OUTPUTDIR; mkosi-obs writes its results below the
 # source tree.
 output_dir=${OUTPUTDIR:-${SRCDIR:?}/usr/src/packages/OTHER}
+source_dir=${OBS_SOURCES_DIR:-/usr/src/packages/SOURCES}
 
 shopt -s nullglob
 disks=("${output_dir}"/*_"${IMAGE_VERSION}"_"${ARCHITECTURE}".raw)
@@ -15,12 +16,23 @@ disks=("${output_dir}"/*_"${IMAGE_VERSION}"_"${ARCHITECTURE}".raw)
 }
 
 for disk in "${disks[@]}"; do
+    # mkosi-obs only carries files matching the last image ID into the
+    # signing stage. Preserve the buildroot RPM of each image as well.
+    disk_name=${disk##*/}
+    image=${disk_name%_${IMAGE_VERSION}_${ARCHITECTURE}.raw}
+    rpm_sources=("${source_dir}"/"${image}"-buildroot-"${IMAGE_VERSION}"-*.rpm)
+    (( ${#rpm_sources[@]} == 1 )) || {
+        printf 'Expected one buildroot RPM for %s, found %d\n' "${image}" "${#rpm_sources[@]}" >&2
+        exit 1
+    }
+    rpm_output=${output_dir}/${rpm_sources[0]##*/}
+    [[ -f ${rpm_output} ]] || install -m 0644 "${rpm_sources[0]}" "${rpm_output}"
     boot=${disk%.raw}.boot.img
     # mkosi-obs copies IMAGE_ID* from the first stage, but a multi-image build
     # also needs the other variant's original factory boot image. OBS exposes
     # all first-stage artifacts in SOURCES; preserve that file unchanged.
     if [[ ! -s ${boot} ]]; then
-        install -m 0644 "/usr/src/packages/SOURCES/${boot##*/}" "${boot}"
+        install -m 0644 "${source_dir}/${boot##*/}" "${boot}"
     fi
     [[ -s ${boot} ]] || {
         echo "Original factory boot.img artifact not found: ${boot}" >&2

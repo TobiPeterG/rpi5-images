@@ -1,0 +1,151 @@
+#!/usr/bin/python3
+"""Export the image build root and its RPM inventory for sysext builds."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
+
+
+def release_fields(text):
+    """Read os-release as data."""
+    fields = {}
+    for line in text.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        key, separator, value = line.partition('=')
+        words = shlex.split(value)
+        if not separator or len(words) != 1:
+            raise ValueError('Invalid os-release field')
+        fields[key] = words[0]
+    return fields
+
+
+def packages(root):
+    query = r'%{NAME}\t%{EPOCHNUM}:%{VERSION}-%{RELEASE}\t%{ARCH}\n'
+    result = subprocess.run(['rpm', '--root', str(root), '--dbpath',
+                             '/usr/lib/sysimage/rpm', '-qa', '--qf', query],
+                            check=True, capture_output=True, text=True)
+    inventory = {}
+    for line in result.stdout.splitlines():
+        name, version, architecture = line.split('\t')
+        inventory[f'{name}.{architecture}'] = version
+    if not inventory:
+        raise ValueError('Empty base RPM inventory')
+    return inventory
+
+
+def check_release(release, image, version):
+    expected = dict(IMAGE_ID=image, IMAGE_VERSION=version,
+                    SYSEXT_LEVEL=f'{image}-{version}')
+    for key, value in expected.items():
+        if release.get(key) != value:
+            raise ValueError(f'Base {key} mismatch: expected {value!r}')
+    if release.get('ID') in (None, '', '_any'):
+        raise ValueError('Base must have a concrete distribution ID')
+
+
+def build_rpm(root, archive, image, version, architecture, epoch):
+    if not re.fullmatch(r'microos-rpi5(ch)?', image):
+        raise ValueError('Unexpected Raspberry Pi image identity')
+    if not re.fullmatch(r'[0-9][a-z0-9.]*', version):
+        raise ValueError('Version must be usable unchanged as an RPM Version')
+    rpm_arch = {'x86-64': 'x86_64', 'arm64': 'aarch64', 'ppc64-le': 'ppc64le',
+                'ppc64': 'ppc64', 's390x': 's390x', 'riscv64': 'riscv64',
+                'arm': 'armv7hl'}[architecture]
+    with archive.open('rb') as source:
+        digest = hashlib.file_digest(source, 'sha256').hexdigest()
+    release = release_fields((root / 'usr/lib/os-release').read_text())
+    check_release(release, image, version)
+    descriptor = dict(format=1, image=image, version=version, architecture=architecture,
+                      distribution='opensuse', distribution_release='tumbleweed',
+                      filename=archive.name, sha256=digest, release=release,
+                      packages=packages(root))
+    with tempfile.TemporaryDirectory(prefix='rpi5-buildroot-rpm-', dir=archive.parent) as directory:
+        work = Path(directory)
+        metadata = work / f'{image}.json'
+        metadata.write_text(json.dumps(descriptor, sort_keys=True) + '\n')
+        spec = work / 'buildroot.spec'
+        spec.write_text(f'''Name: {image}-buildroot
+Version: {version}
+Release: 1.{epoch}
+Summary: Exact {image} build root for system extensions
+License: MIT
+AutoReqProv: no
+%description
+Versioned filesystem archive and compatibility/RPM-inventory metadata for
+offline mkosi system extension builds.
+%prep
+%build
+%install
+mkdir -p %{{buildroot}}%{{_datadir}}/sysext-buildroots
+cp --reflink=auto '{archive}' %{{buildroot}}%{{_datadir}}/sysext-buildroots/
+cp '{metadata}' %{{buildroot}}%{{_datadir}}/sysext-buildroots/
+%files
+%dir %{{_datadir}}/sysext-buildroots
+%{{_datadir}}/sysext-buildroots/{archive.name}
+%{{_datadir}}/sysext-buildroots/{metadata.name}
+%changelog
+''')
+        subprocess.run(['rpmbuild', '-bb', str(spec), '--target', rpm_arch,
+                        '--define', f'_topdir {work}',
+                        '--define', f'_rpmdir {archive.parent}',
+                        '--define', '_rpmfilename %{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm',
+                        '--define', '_binary_payload w0.gzdio',
+                        '--define', '__os_install_post %{nil}',
+                        '--define', '_build_id_links none',
+                        '--define', 'debug_package %{nil}'],
+                       env=dict(os.environ, SOURCE_DATE_EPOCH=str(epoch)), check=True)
+
+
+def main():
+    image, version, architecture = (os.environ[k] for k in ('IMAGE_ID', 'IMAGE_VERSION', 'ARCHITECTURE'))
+    if not re.fullmatch(r'microos-rpi5(ch)?', image):
+        raise ValueError('Unexpected Raspberry Pi image identity')
+    if not re.fullmatch(r'[0-9][a-z0-9.]*', version):
+        raise ValueError('Version must be usable unchanged as an RPM Version')
+    if architecture != 'arm64':
+        raise ValueError('Unexpected Raspberry Pi architecture')
+    root = Path(os.environ['BUILDROOT'])
+    out = Path(os.environ['OUTPUTDIR'])
+    epoch = int(os.environ.get('SOURCE_DATE_EPOCH') or time.time())
+    archive = out / f'{image}_{version}_{architecture}.buildroot.tar.xz'
+    if archive.exists():
+        raise FileExistsError(archive)
+    try:
+        with subprocess.Popen([
+            'tar', '--create', '--file=-', '--directory', str(root),
+            '--sort=name', '--format=pax', '--numeric-owner', '--sparse',
+            '--acls', '--selinux', '--xattrs', '--xattrs-include=*',
+            '--pax-option=exthdr.name=%d/PaxHeaders/%f,delete=atime,delete=ctime',
+            f'--mtime=@{epoch}', '--clamp-mtime',
+            '--exclude=./boot', '--exclude=./efi', '--exclude=./dev/*',
+            '--exclude=./proc/*', '--exclude=./sys/*', '--exclude=./run/*',
+            '--exclude=./tmp/*', '--exclude=./var/tmp/*',
+            '--exclude=./var/cache/*', '--exclude=./work', '.'],
+            stdout=subprocess.PIPE) as tar:
+            with archive.open('wb') as output:
+                subprocess.run(['xz', '--threads=2', '-6', '--stdout'],
+                                        stdin=tar.stdout, stdout=output, check=True)
+            tar.stdout.close()
+            if tar.wait() != 0:
+                raise subprocess.CalledProcessError(tar.returncode, tar.args)
+        build_rpm(root, archive, image, version, architecture, epoch)
+    finally:
+        archive.unlink(missing_ok=True)
+
+    for path in ('usr/lib/sysimage/rpm', 'var/lib/rpm', 'var/lib/zypp', 'var/cache/zypp'):
+        target = root / path
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+
+
+if __name__ == '__main__':
+    main()
