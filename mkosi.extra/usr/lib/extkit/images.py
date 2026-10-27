@@ -35,7 +35,7 @@ def image_tree(config: ExtkitConfig, image):
             fail("expected an ExtKit GPT extension image")
         process.run([
             config.erofs_fsck_tool, f"--offset={partitions['extkit-root']['offset']}",
-            f"--extract={tree}", "--overwrite", "--preserve", str(image),
+            f"--extract={tree}", "--overwrite", "--preserve", "--xattrs", str(image),
         ], check=True)
         yield tree
 
