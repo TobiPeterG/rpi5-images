@@ -10,14 +10,14 @@ case " ${cmdline} " in
 esac
 
 [[ -r ${sysroot}/etc/selinux/config ]] || {
-    echo "extkit: verified root has no SELinux configuration" >&2
+    echo "image boot: verified root has no SELinux configuration" >&2
     exit 1
 }
 
 # Query the verified root's file-context mappings
 root_context=$(chroot "${sysroot}" /usr/sbin/matchpathcon -N -n /)
 [[ ${root_context} == *:*:*:* && ${root_context} != *$'\n'* ]] || {
-    echo "extkit: root policy returned an invalid root-directory context" >&2
+    echo "image boot: root policy returned an invalid root-directory context" >&2
     exit 1
 }
 

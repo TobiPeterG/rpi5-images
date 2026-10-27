@@ -14,7 +14,7 @@ data=/usr/share/langset/${lang}
 [[ -f ${data} ]] || { echo "Locale not found: ${lang}" >&2; exit 1; }
 
 RC_LANG= KEYTABLE= CONSOLE_FONT= TIMEZONE=
-# These are distribution-provided defaults from the verified system image.
+# These are distribution-provided defaults from the system image.
 source "${data}"
 [[ -z ${RC_LANG} ]] || localectl set-locale "LANG=${RC_LANG}"
 if [[ -n ${CONSOLE_FONT} ]]; then

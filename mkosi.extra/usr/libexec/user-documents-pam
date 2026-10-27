@@ -1,0 +1,31 @@
+#!/usr/bin/python3
+"""Request home setup during a PAM session before pam_systemd runs."""
+import os
+import pwd
+import subprocess
+import sys
+
+
+def main():
+    # user@UID.service already requires the setup unit.
+    if os.environ.get('PAM_SERVICE') == 'systemd-user':
+        return
+    username = os.environ.get('PAM_USER', '')
+    if not username or '/' in username or '\0' in username:
+        raise ValueError('invalid PAM user')
+    account = pwd.getpwnam(username)
+    if account.pw_name != username or pwd.getpwuid(account.pw_uid).pw_name != username:
+        raise ValueError('PAM user lookup mismatch or shared UID')
+    if not ((account.pw_name == 'root' and account.pw_uid == 0 and account.pw_dir == '/root')
+            or (account.pw_uid != 0 and account.pw_dir.startswith('/home/') and account.pw_dir.count('/') == 2)):
+        return
+    subprocess.run(['/usr/bin/systemctl', 'start', f'user-documents-setup@{account.pw_uid}.service'],
+                   env={'PATH': '/usr/sbin:/usr/bin', 'SYSTEMD_PAGER': 'cat'}, check=True)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (KeyError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f'Cannot prepare user documents: {error}', file=sys.stderr)
+        sys.exit(1)

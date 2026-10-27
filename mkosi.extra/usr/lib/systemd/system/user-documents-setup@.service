@@ -1,0 +1,10 @@
+[Unit]
+Description=Prepare volatile home and persistent documents for UID %i
+RequiresMountsFor=/.state
+After=local-fs.target systemd-sysusers.service systemd-confext.service systemd-sysext.service
+Before=user@%i.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -I /usr/libexec/user-documents-setup %i

@@ -1,0 +1,128 @@
+#!/usr/bin/python3
+"""Create one volatile home and mount its persistent documents directory."""
+
+import fcntl
+import os
+import pwd
+import stat
+import subprocess
+import sys
+from contextlib import contextmanager
+
+STATE = '/.state'
+HOMES = '/home'
+LOCK = '/run/user-documents-setup.lock'
+FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+@contextmanager
+def closing_fd(fd):
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def directory(parent, name, mode, uid, gid):
+    if name in ('', '.', '..') or '/' in name:
+        raise ValueError(f'invalid directory name: {name!r}')
+    try:
+        os.mkdir(name, mode, dir_fd=parent)
+        created = True
+    except FileExistsError:
+        created = False
+    fd = os.open(name, FLAGS, dir_fd=parent)
+    try:
+        if created:
+            os.fchmod(fd, mode)
+            os.fchown(fd, uid, gid)
+        info = os.fstat(fd)
+        if info.st_uid != uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) & 0o022:
+            raise ValueError(f'unsafe ownership or permissions on {name!r}')
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def supported(account):
+    return ((account.pw_name == 'root' and account.pw_uid == 0 and account.pw_dir == '/root')
+            or (account.pw_uid != 0 and account.pw_dir.startswith('/home/')
+                and account.pw_dir.count('/') == 2))
+
+
+def mount_options(path):
+    result = subprocess.run(['/usr/bin/findmnt', '-rn', '-o', 'OPTIONS', '--mountpoint', path],
+                            capture_output=True, text=True)
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        raise ValueError(f'cannot inspect mount at {path}: {result.stderr.strip()}')
+    lines = result.stdout.splitlines()
+    if len(lines) != 1:
+        raise ValueError(f'multiple or ambiguous mounts at {path}')
+    return set(lines[0].split(','))
+
+
+def ensure_mount(source, dest, target):
+    options = mount_options(target)
+    if options is not None:
+        src, dst = os.fstat(source), os.fstat(dest)
+        if (src.st_dev, src.st_ino) != (dst.st_dev, dst.st_ino):
+            raise ValueError(f'unexpected filesystem mounted at {target}')
+        if not {'rw', 'nodev', 'nosuid', 'noexec'}.issubset(options):
+            raise ValueError(f'unsafe mount options at {target}')
+        return
+    subprocess.run(['/usr/bin/mount', '--bind', f'/proc/self/fd/{source}', f'/proc/self/fd/{dest}'],
+                   pass_fds=(source, dest), check=True)
+    try:
+        subprocess.run(['/usr/bin/mount', '-o', 'remount,bind,nodev,nosuid,noexec', target], check=True)
+        subprocess.run(['/usr/sbin/restorecon', '-F', target], check=True)
+    except BaseException:
+        subprocess.run(['/usr/bin/umount', target], check=False)
+        raise
+
+
+def setup(account):
+    if not supported(account):
+        return
+    if mount_options(STATE) is None:
+        raise ValueError('/.state is not mounted')
+    if mount_options(HOMES) is not None:
+        raise ValueError('/home must reside on the volatile root')
+    lock_fd = os.open(LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with closing_fd(lock_fd) as lock:
+        info = os.fstat(lock)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
+            raise ValueError('unsafe setup lock')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with closing_fd(os.open(STATE, FLAGS)) as state, closing_fd(os.open(HOMES, FLAGS)) as homes:
+            with closing_fd(directory(state, 'documents', 0o700, 0, 0)) as documents:
+                parent = os.open('/', FLAGS) if account.pw_name == 'root' else os.dup(homes)
+                with closing_fd(parent) as home_parent:
+                    name = 'root' if account.pw_name == 'root' else account.pw_dir[6:]
+                    with closing_fd(directory(home_parent, name, 0o700, account.pw_uid, account.pw_gid)) as home:
+                        target = f'{account.pw_dir}/Documents'
+                        with closing_fd(directory(home, 'Documents', 0o700, account.pw_uid, account.pw_gid)) as dest, \
+                             closing_fd(directory(documents, str(account.pw_uid), 0o700, account.pw_uid, account.pw_gid)) as source:
+                            subprocess.run(['/usr/sbin/restorecon', '-F', account.pw_dir, target], check=True)
+                            ensure_mount(source, dest, target)
+                            print(f'{account.pw_name}: {target}', flush=True)
+
+
+def main():
+    if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdecimal():
+        raise ValueError('expected a numeric UID')
+    uid = int(sys.argv[1])
+    account = pwd.getpwuid(uid)
+    if account.pw_uid != uid:
+        raise ValueError('UID lookup mismatch')
+    setup(account)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (KeyError, OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f'Cannot prepare user documents: {error}', file=sys.stderr)
+        sys.exit(1)

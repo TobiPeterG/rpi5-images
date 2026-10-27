@@ -8,7 +8,7 @@ backing=/run/systemd/overlay-sysroot
 view=${sysroot}/.overlay/upper
 
 fallback() {
-    echo "extkit: custom overlay setup failed; using systemd-volatile-root" >&2
+    echo "image boot: custom overlay setup failed; using systemd-volatile-root" >&2
     exec /usr/lib/systemd/systemd-volatile-root yes "${sysroot}"
 }
 
@@ -41,10 +41,10 @@ if [[ ! -e /run/systemd/volatile-root && ! -L /run/systemd/volatile-root ]]; the
         if partition_devnum=$(find_originating_partition "${mapper_devnum}"); then
             ln -s "/dev/block/${partition_devnum}" /run/systemd/volatile-root || true
         else
-            echo "extkit: could not find the originating root partition" >&2
+            echo "image boot: could not find the originating root partition" >&2
         fi
     else
-        echo "extkit: could not determine the volatile root block device" >&2
+        echo "image boot: could not determine the volatile root block device" >&2
     fi
 fi
 
@@ -62,11 +62,11 @@ fi
 
 if mount --bind "${backing}/upper" "${view}"; then
     if ! mount -o remount,bind,ro,nodev,nosuid,noexec "${view}"; then
-        echo "extkit: upper view could not be made read-only; hiding it" >&2
+        echo "image boot: upper view could not be made read-only; hiding it" >&2
         umount "${view}" || true
     fi
 else
-    echo "extkit: upper view unavailable; root overlay remains usable" >&2
+    echo "image boot: upper view unavailable; root overlay remains usable" >&2
 fi
 
 umount "${backing}" || true
