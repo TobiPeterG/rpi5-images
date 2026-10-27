@@ -1,0 +1,24 @@
+#!/usr/bin/bash
+# No policy is loaded here. PID 1 loads it from the verified root on re-exec,
+# before starting host services, and relabels the API filesystems at that point.
+set -euo pipefail
+
+sysroot=${1:-/sysroot}
+cmdline=$(</proc/cmdline)
+case " ${cmdline} " in
+    *" selinux=0 "*) exit 0 ;;
+esac
+
+[[ -r ${sysroot}/etc/selinux/config ]] || {
+    echo "extkit: verified root has no SELinux configuration" >&2
+    exit 1
+}
+
+# Query the verified root's file-context mappings
+root_context=$(chroot "${sysroot}" /usr/sbin/matchpathcon -N -n /)
+[[ ${root_context} == *:*:*:* && ${root_context} != *$'\n'* ]] || {
+    echo "extkit: root policy returned an invalid root-directory context" >&2
+    exit 1
+}
+
+chcon -- "${root_context}" "${sysroot}"

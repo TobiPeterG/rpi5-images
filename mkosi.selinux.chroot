@@ -1,0 +1,16 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+source /etc/selinux/config
+[[ ${SELINUXTYPE:?} =~ ^[A-Za-z0-9_-]+$ ]]
+policy_dir=/etc/selinux/${SELINUXTYPE}
+shopt -s nullglob
+policies=("${policy_dir}"/policy/policy.[0-9]*)
+(( ${#policies[@]} > 0 )) || {
+    echo "SELinux binary policy missing from the final image" >&2
+    exit 1
+}
+policy=$(printf '%s\n' "${policies[@]}" | sort -V | tail -n 1)
+setfiles -mF -c "${policy}" \
+    -e /proc -e /sys -e /dev -e /run \
+    "${policy_dir}/contexts/files/file_contexts" /
