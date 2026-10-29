@@ -11,7 +11,7 @@ if ! grep -q '^CONFEXT_LEVEL=' /usr/lib/os-release; then
     printf '\nCONFEXT_LEVEL=microos-confext-1\n' >> /usr/lib/os-release
 fi
 install -d -m 0755 /home /var/log /var/lib/extensions /var/lib/confexts
-install -d -m 0755 /etc/ssh/authorized_keys
+install -d -m 0755 /etc/ssh/authorized_keys /etc/skel
 # Insert before pam_systemd so the user's mount exists before its manager starts.
 for pam_stack in /etc/pam.d/common-session-pc /etc/pam.d/common-session-nonlogin-pc; do
     [[ -f ${pam_stack} ]] || { echo "Missing PAM stack: ${pam_stack}" >&2; exit 1; }

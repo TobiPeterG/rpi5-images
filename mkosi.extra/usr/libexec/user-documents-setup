@@ -1,5 +1,5 @@
 #!/usr/bin/bash -p
-# Create a volatile home and mount a persistent Documents directory for one UID.
+# Create a volatile home and mount a persistent user directory for one UID.
 set -euo pipefail
 umask 077
 source /usr/libexec/user-documents-common
@@ -54,27 +54,32 @@ if [[ $account_name == root ]]; then
 else
     exec {parent_fd}<&"$homes_fd"
     home_name=${account_home#/home/}
+    if [[ ! -e $account_home && ! -L $account_home ]]; then
+        /usr/bin/env -i PATH=/usr/sbin:/usr/bin /usr/sbin/mkhomedir_helper \
+            "$account_name" 0077 /etc/skel 0700 || fail 'cannot create home from skeleton'
+        restorecon -RF -- "$account_home" || fail 'cannot label home skeleton'
+    fi
 fi
 open_dir "$parent_fd" "$home_name" "$account_uid" "$account_gid" 0700; home_fd=$opened_fd
-open_dir "$home_fd" Documents "$account_uid" "$account_gid" 0700; dest_fd=$opened_fd
+open_dir "$home_fd" Persistent "$account_uid" "$account_gid" 0700; dest_fd=$opened_fd
 open_dir "$documents_fd" "$account_uid" "$account_uid" "$account_gid" 0700; source_fd=$opened_fd
-target=$account_home/Documents
-restorecon -F -- "$account_home" "$target" || fail 'cannot label home or Documents'
+target=$account_home/Persistent
+restorecon -F -- "$account_home" "$target" || fail 'cannot label home or Persistent'
 
 options=
 if options=$(findmnt -rn -o OPTIONS --mountpoint "$target"); then
-    [[ $options != *$'\n'* ]] || fail 'multiple mounts on Documents'
-    [[ $(stat -Lc '%d:%i' "/proc/self/fd/$source_fd") == "$(stat -Lc '%d:%i' "/proc/self/fd/$dest_fd")" ]] || fail 'unexpected filesystem mounted at Documents'
+    [[ $options != *$'\n'* ]] || fail 'multiple mounts on Persistent'
+    [[ $(stat -Lc '%d:%i' "/proc/self/fd/$source_fd") == "$(stat -Lc '%d:%i' "/proc/self/fd/$dest_fd")" ]] || fail 'unexpected filesystem mounted at Persistent'
     for option in rw nodev nosuid noexec; do
-        [[ ,$options, == *,$option,* ]] || fail "unsafe mount options at Documents: missing $option"
+        [[ ,$options, == *,$option,* ]] || fail "unsafe mount options at Persistent: missing $option"
     done
 else
     result=$?
-    [[ $result == 1 ]] || fail 'cannot inspect Documents mount'
-    mount --bind "/proc/self/fd/$source_fd" "/proc/self/fd/$dest_fd" || fail 'cannot bind Documents'
+    [[ $result == 1 ]] || fail 'cannot inspect Persistent mount'
+    mount --bind "/proc/self/fd/$source_fd" "/proc/self/fd/$dest_fd" || fail 'cannot bind Persistent'
     if ! mount -o remount,bind,nodev,nosuid,noexec -- "$target" || ! restorecon -F -- "$target"; then
         umount -- "$target" || :
-        fail 'cannot secure or label Documents mount'
+        fail 'cannot secure or label Persistent mount'
     fi
 fi
 printf '%s: %s\n' "$account_name" "$target"

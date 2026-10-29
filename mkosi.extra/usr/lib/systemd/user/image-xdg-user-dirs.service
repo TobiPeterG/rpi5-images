@@ -1,0 +1,10 @@
+[Unit]
+Description=Create standard XDG user directories when available
+ConditionPathExists=/usr/bin/xdg-user-dirs-update
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/xdg-user-dirs-update
+
+[Install]
+WantedBy=default.target

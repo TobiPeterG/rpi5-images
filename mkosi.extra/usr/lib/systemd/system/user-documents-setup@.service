@@ -1,5 +1,5 @@
 [Unit]
-Description=Prepare volatile home and persistent documents for UID %i
+Description=Prepare volatile home and persistent user storage for UID %i
 RequiresMountsFor=/.state
 After=local-fs.target systemd-sysusers.service systemd-confext.service systemd-sysext.service
 Before=user@%i.service
