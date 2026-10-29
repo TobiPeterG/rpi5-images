@@ -1,0 +1,21 @@
+# Shared account validation for the PAM hook and mount helper.
+PATH=/usr/sbin:/usr/bin
+export PATH
+IFS=$' \t\n'
+
+load_account() {
+    local query=${1:?} entry by_uid
+    entry=$(getent passwd -- "$query") || return 1
+    [[ $entry != *$'\n'* ]] || return 1
+    IFS=: read -r account_name _ account_uid account_gid _ account_home _ <<< "$entry"
+    [[ -n $account_name && $account_uid =~ ^[0-9]+$ && $account_gid =~ ^[0-9]+$ ]] || return 1
+    by_uid=$(getent passwd -- "$account_uid") || return 1
+    [[ ${by_uid%%:*} == "$account_name" && $by_uid != *$'\n'* ]] || return 1
+}
+
+has_documents_home() {
+    if [[ $account_name == root && $account_uid == 0 && $account_home == /root ]]; then
+        return 0
+    fi
+    [[ $account_uid != 0 && $account_home == /home/* && ${account_home#/home/} != */* && ${account_home#/home/} != . && ${account_home#/home/} != .. && -n ${account_home#/home/} ]]
+}

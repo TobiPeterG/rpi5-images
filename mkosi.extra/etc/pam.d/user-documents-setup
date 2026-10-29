@@ -1,2 +1,2 @@
 # The systemd-user PAM stack is covered by user@.service's dependency.
-session requisite pam_exec.so seteuid type=open_session /usr/bin/python3 -I /usr/libexec/user-documents-pam
+session requisite pam_exec.so stdout seteuid type=open_session /usr/bin/bash -p /usr/libexec/user-documents-pam

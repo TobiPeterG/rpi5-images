@@ -1,128 +1,80 @@
-#!/usr/bin/python3
-"""Create one volatile home and mount its persistent documents directory."""
+#!/usr/bin/bash -p
+# Create a volatile home and mount a persistent Documents directory for one UID.
+set -euo pipefail
+umask 077
+source /usr/libexec/user-documents-common
 
-import fcntl
-import os
-import pwd
-import stat
-import subprocess
-import sys
-from contextlib import contextmanager
+fail() { printf 'Cannot prepare user documents: %s\n' "$*" >&2; exit 1; }
+uid=${1:-}
+[[ $uid =~ ^[0-9]+$ ]] || fail 'expected a numeric UID'
+load_account "$uid" || fail "cannot resolve UID $uid"
+[[ $account_uid == "$uid" ]] || fail 'UID lookup mismatch'
+has_documents_home || exit 0
 
-STATE = '/.state'
-HOMES = '/home'
-LOCK = '/run/user-documents-setup.lock'
-FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+findmnt -rn --mountpoint /.state >/dev/null || fail '/.state is not mounted'
+if findmnt -rn --mountpoint /home >/dev/null; then
+    fail '/home must reside on the volatile root'
+fi
 
+# The root-owned lock serializes multiple logins and prevents stacked mounts.
+[[ ! -L /run/user-documents-setup.lock ]] || fail 'unsafe setup lock'
+exec {lock_fd}>>/run/user-documents-setup.lock
+[[ -f /proc/self/fd/$lock_fd && $(stat -Lc '%u %a' "/proc/self/fd/$lock_fd") == '0 600' ]] || fail 'unsafe setup lock'
+flock -x "$lock_fd"
 
-@contextmanager
-def closing_fd(fd):
-    try:
-        yield fd
-    finally:
-        os.close(fd)
+# Open verified directory descriptors.
+open_dir() {
+    local parent=$1 name=$2 owner=$3 group=$4 mode=$5 path expected actual details got_uid got_gid got_mode
+    [[ -n $name && $name != . && $name != .. && $name != */* ]] || fail 'invalid directory name'
+    path="/proc/self/fd/$parent/$name"
+    [[ ! -L $path ]] || fail "symlinked directory: $name"
+    if [[ ! -e $path ]]; then
+        mkdir -m "$mode" -- "$path" || fail "cannot create $name"
+        chown -h "$owner:$group" -- "$path" || fail "cannot set owner on $name"
+    fi
+    [[ -d $path && ! -L $path ]] || fail "invalid directory: $name"
+    exec {opened_fd}<"$path" || fail "cannot open $name"
+    expected=$(readlink -f -- "/proc/self/fd/$parent")
+    expected=${expected%/}/$name
+    actual=$(readlink -f -- "/proc/self/fd/$opened_fd")
+    [[ $actual == "$expected" ]] || fail "directory changed during setup: $name"
+    details=$(stat -Lc '%u %g %a' "/proc/self/fd/$opened_fd") || fail "cannot inspect $name"
+    read -r got_uid got_gid got_mode <<< "$details"
+    [[ $got_uid == "$owner" && $got_gid == "$group" && $got_mode =~ ^[0-7]+$ ]] || fail "unsafe ownership on $name"
+    (( (8#$got_mode & 8#022) == 0 )) || fail "unsafe permissions on $name"
+}
 
+[[ -d /.state && ! -L /.state && -d /home && ! -L /home ]] || fail 'invalid mount directories'
+exec {state_fd}</.state
+exec {homes_fd}</home
+open_dir "$state_fd" documents 0 0 0700; documents_fd=$opened_fd
+if [[ $account_name == root ]]; then
+    exec {parent_fd}</
+    home_name=root
+else
+    exec {parent_fd}<&"$homes_fd"
+    home_name=${account_home#/home/}
+fi
+open_dir "$parent_fd" "$home_name" "$account_uid" "$account_gid" 0700; home_fd=$opened_fd
+open_dir "$home_fd" Documents "$account_uid" "$account_gid" 0700; dest_fd=$opened_fd
+open_dir "$documents_fd" "$account_uid" "$account_uid" "$account_gid" 0700; source_fd=$opened_fd
+target=$account_home/Documents
+restorecon -F -- "$account_home" "$target" || fail 'cannot label home or Documents'
 
-def directory(parent, name, mode, uid, gid):
-    if name in ('', '.', '..') or '/' in name:
-        raise ValueError(f'invalid directory name: {name!r}')
-    try:
-        os.mkdir(name, mode, dir_fd=parent)
-        created = True
-    except FileExistsError:
-        created = False
-    fd = os.open(name, FLAGS, dir_fd=parent)
-    try:
-        if created:
-            os.fchmod(fd, mode)
-            os.fchown(fd, uid, gid)
-        info = os.fstat(fd)
-        if info.st_uid != uid or info.st_gid != gid or stat.S_IMODE(info.st_mode) & 0o022:
-            raise ValueError(f'unsafe ownership or permissions on {name!r}')
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
-
-
-def supported(account):
-    return ((account.pw_name == 'root' and account.pw_uid == 0 and account.pw_dir == '/root')
-            or (account.pw_uid != 0 and account.pw_dir.startswith('/home/')
-                and account.pw_dir.count('/') == 2))
-
-
-def mount_options(path):
-    result = subprocess.run(['/usr/bin/findmnt', '-rn', '-o', 'OPTIONS', '--mountpoint', path],
-                            capture_output=True, text=True)
-    if result.returncode == 1:
-        return None
-    if result.returncode != 0:
-        raise ValueError(f'cannot inspect mount at {path}: {result.stderr.strip()}')
-    lines = result.stdout.splitlines()
-    if len(lines) != 1:
-        raise ValueError(f'multiple or ambiguous mounts at {path}')
-    return set(lines[0].split(','))
-
-
-def ensure_mount(source, dest, target):
-    options = mount_options(target)
-    if options is not None:
-        src, dst = os.fstat(source), os.fstat(dest)
-        if (src.st_dev, src.st_ino) != (dst.st_dev, dst.st_ino):
-            raise ValueError(f'unexpected filesystem mounted at {target}')
-        if not {'rw', 'nodev', 'nosuid', 'noexec'}.issubset(options):
-            raise ValueError(f'unsafe mount options at {target}')
-        return
-    subprocess.run(['/usr/bin/mount', '--bind', f'/proc/self/fd/{source}', f'/proc/self/fd/{dest}'],
-                   pass_fds=(source, dest), check=True)
-    try:
-        subprocess.run(['/usr/bin/mount', '-o', 'remount,bind,nodev,nosuid,noexec', target], check=True)
-        subprocess.run(['/usr/sbin/restorecon', '-F', target], check=True)
-    except BaseException:
-        subprocess.run(['/usr/bin/umount', target], check=False)
-        raise
-
-
-def setup(account):
-    if not supported(account):
-        return
-    if mount_options(STATE) is None:
-        raise ValueError('/.state is not mounted')
-    if mount_options(HOMES) is not None:
-        raise ValueError('/home must reside on the volatile root')
-    lock_fd = os.open(LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
-    with closing_fd(lock_fd) as lock:
-        info = os.fstat(lock)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
-            raise ValueError('unsafe setup lock')
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        with closing_fd(os.open(STATE, FLAGS)) as state, closing_fd(os.open(HOMES, FLAGS)) as homes:
-            with closing_fd(directory(state, 'documents', 0o700, 0, 0)) as documents:
-                parent = os.open('/', FLAGS) if account.pw_name == 'root' else os.dup(homes)
-                with closing_fd(parent) as home_parent:
-                    name = 'root' if account.pw_name == 'root' else account.pw_dir[6:]
-                    with closing_fd(directory(home_parent, name, 0o700, account.pw_uid, account.pw_gid)) as home:
-                        target = f'{account.pw_dir}/Documents'
-                        with closing_fd(directory(home, 'Documents', 0o700, account.pw_uid, account.pw_gid)) as dest, \
-                             closing_fd(directory(documents, str(account.pw_uid), 0o700, account.pw_uid, account.pw_gid)) as source:
-                            subprocess.run(['/usr/sbin/restorecon', '-F', account.pw_dir, target], check=True)
-                            ensure_mount(source, dest, target)
-                            print(f'{account.pw_name}: {target}', flush=True)
-
-
-def main():
-    if len(sys.argv) != 2 or not sys.argv[1].isascii() or not sys.argv[1].isdecimal():
-        raise ValueError('expected a numeric UID')
-    uid = int(sys.argv[1])
-    account = pwd.getpwuid(uid)
-    if account.pw_uid != uid:
-        raise ValueError('UID lookup mismatch')
-    setup(account)
-
-
-if __name__ == '__main__':
-    try:
-        main()
-    except (KeyError, OSError, ValueError, subprocess.CalledProcessError) as error:
-        print(f'Cannot prepare user documents: {error}', file=sys.stderr)
-        sys.exit(1)
+options=
+if options=$(findmnt -rn -o OPTIONS --mountpoint "$target"); then
+    [[ $options != *$'\n'* ]] || fail 'multiple mounts on Documents'
+    [[ $(stat -Lc '%d:%i' "/proc/self/fd/$source_fd") == "$(stat -Lc '%d:%i' "/proc/self/fd/$dest_fd")" ]] || fail 'unexpected filesystem mounted at Documents'
+    for option in rw nodev nosuid noexec; do
+        [[ ,$options, == *,$option,* ]] || fail "unsafe mount options at Documents: missing $option"
+    done
+else
+    result=$?
+    [[ $result == 1 ]] || fail 'cannot inspect Documents mount'
+    mount --bind "/proc/self/fd/$source_fd" "/proc/self/fd/$dest_fd" || fail 'cannot bind Documents'
+    if ! mount -o remount,bind,nodev,nosuid,noexec -- "$target" || ! restorecon -F -- "$target"; then
+        umount -- "$target" || :
+        fail 'cannot secure or label Documents mount'
+    fi
+fi
+printf '%s: %s\n' "$account_name" "$target"

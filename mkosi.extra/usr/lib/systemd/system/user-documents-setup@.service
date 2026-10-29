@@ -7,4 +7,4 @@ Before=user@%i.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/python3 -I /usr/libexec/user-documents-setup %i
+ExecStart=/usr/bin/bash -p /usr/libexec/user-documents-setup %i
