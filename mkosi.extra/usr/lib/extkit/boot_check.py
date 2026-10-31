@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 
 from . import activation
 from . import images
@@ -62,7 +61,7 @@ def boot_check_locked(config: ExtkitConfig, args):
                 for entry in list(directory.iterdir()):
                     if entry.is_dir():
                         quarantine.quarantine_extension(config, entry, kind, "directory/subvolume extensions are not authenticated images")
-    activation.command_sync(config, SimpleNamespace(kind=args.kind, boot=True))
+    activation.command_sync(config, args)
     # Verify individual candidates before asking systemd to read release metadata:
     authenticated = set()
     for directory in sorted(quarantine.extension_search_directories(config)[args.kind]):
