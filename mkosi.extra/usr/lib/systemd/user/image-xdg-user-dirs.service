@@ -1,6 +1,7 @@
 [Unit]
 Description=Create standard XDG user directories when available
 ConditionPathExists=/usr/bin/xdg-user-dirs-update
+ConditionPathExists=/run/user-home-setup/%U.created
 
 [Service]
 Type=oneshot

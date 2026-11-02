@@ -108,9 +108,11 @@ def _build(config: ExtkitConfig, args, policy_only=False):
                     if previous[kind]:
                         process.run(['cp', '-a', f'{inherited_tree}/.', str(tree)], check=True)
                 for relative in grouped[kind]:
+                    overlay.copy_parent_directories(config, relative, tree)
                     overlay.copy_selected(overlay.live_file(config, relative), tree / relative)
                 whiteouts = []
                 for relative in removals[kind]:
+                    overlay.copy_parent_directories(config, relative, tree)
                     target = tree / relative
                     overlay.remove_path(target)
                     target.parent.mkdir(parents=True, exist_ok=True)

@@ -18,5 +18,5 @@ load_account "$username" || fail 'cannot resolve the PAM account or its UID is s
 [[ $account_name == "$username" ]] || fail 'account lookup did not return the requested user'
 has_documents_home || exit 0
 if ! output=$(/usr/bin/env -i PATH=/usr/sbin:/usr/bin SYSTEMD_PAGER=cat /usr/bin/systemctl start "user-documents-setup@${account_uid}.service" 2>&1); then
-    fail "cannot prepare Documents for ${account_name}: ${output}. See journalctl -b -u user-documents-setup@${account_uid}.service"
+    fail "cannot prepare home and persistent storage for ${account_name}: ${output}. See journalctl -b -u user-documents-setup@${account_uid}.service"
 fi

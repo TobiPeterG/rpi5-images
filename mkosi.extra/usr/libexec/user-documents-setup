@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 source /usr/libexec/user-documents-common
 
-fail() { printf 'Cannot prepare user documents: %s\n' "$*" >&2; exit 1; }
+fail() { printf 'Cannot prepare user home: %s\n' "$*" >&2; exit 1; }
 uid=${1:-}
 [[ $uid =~ ^[0-9]+$ ]] || fail 'expected a numeric UID'
 load_account "$uid" || fail "cannot resolve UID $uid"
@@ -12,11 +12,8 @@ load_account "$uid" || fail "cannot resolve UID $uid"
 has_documents_home || exit 0
 
 findmnt -rn --mountpoint /.state >/dev/null || fail '/.state is not mounted'
-if findmnt -rn --mountpoint /home >/dev/null; then
-    fail '/home must reside on the volatile root'
-fi
 
-# The root-owned lock serializes multiple logins and prevents stacked mounts.
+# The root-owned lock serializes concurrent home/storage creation.
 [[ ! -L /run/user-documents-setup.lock ]] || fail 'unsafe setup lock'
 exec {lock_fd}>>/run/user-documents-setup.lock
 [[ -f /proc/self/fd/$lock_fd && $(stat -Lc '%u %a' "/proc/self/fd/$lock_fd") == '0 600' ]] || fail 'unsafe setup lock'
@@ -47,7 +44,9 @@ open_dir() {
 [[ -d /.state && ! -L /.state && -d /home && ! -L /home ]] || fail 'invalid mount directories'
 exec {state_fd}</.state
 exec {homes_fd}</home
-open_dir "$state_fd" documents 0 0 0700; documents_fd=$opened_fd
+open_dir "$state_fd" documents 0 0 0711; documents_fd=$opened_fd
+chmod 0711 "/proc/self/fd/$documents_fd" || fail 'cannot allow storage traversal'
+created_home=no
 if [[ $account_name == root ]]; then
     exec {parent_fd}</
     home_name=root
@@ -58,28 +57,26 @@ else
         /usr/bin/env -i PATH=/usr/sbin:/usr/bin /usr/sbin/mkhomedir_helper \
             "$account_name" 0077 /etc/skel 0700 || fail 'cannot create home from skeleton'
         restorecon -RF -- "$account_home" || fail 'cannot label home skeleton'
+        created_home=yes
     fi
 fi
+[[ -e $account_home || -L $account_home ]] || created_home=yes
 open_dir "$parent_fd" "$home_name" "$account_uid" "$account_gid" 0700; home_fd=$opened_fd
-open_dir "$home_fd" Persistent "$account_uid" "$account_gid" 0700; dest_fd=$opened_fd
 open_dir "$documents_fd" "$account_uid" "$account_uid" "$account_gid" 0700; source_fd=$opened_fd
-target=$account_home/Persistent
-restorecon -F -- "$account_home" "$target" || fail 'cannot label home or Persistent'
+restorecon -F -- /.state/documents "/.state/documents/$account_uid" || fail 'cannot label persistent storage'
 
-options=
-if options=$(findmnt -rn -o OPTIONS --mountpoint "$target"); then
-    [[ $options != *$'\n'* ]] || fail 'multiple mounts on Persistent'
-    [[ $(stat -Lc '%d:%i' "/proc/self/fd/$source_fd") == "$(stat -Lc '%d:%i' "/proc/self/fd/$dest_fd")" ]] || fail 'unexpected filesystem mounted at Persistent'
-    for option in rw nodev nosuid noexec; do
-        [[ ,$options, == *,$option,* ]] || fail "unsafe mount options at Persistent: missing $option"
-    done
-else
-    result=$?
-    [[ $result == 1 ]] || fail 'cannot inspect Persistent mount'
-    mount --bind "/proc/self/fd/$source_fd" "/proc/self/fd/$dest_fd" || fail 'cannot bind Persistent'
-    if ! mount -o remount,bind,nodev,nosuid,noexec -- "$target" || ! restorecon -F -- "$target"; then
-        umount -- "$target" || :
-        fail 'cannot secure or label Persistent mount'
+if [[ $created_home == yes ]]; then
+    persistent="/proc/self/fd/$home_fd/Persistent"
+    if [[ ! -e $persistent && ! -L $persistent ]]; then
+        ln -s -- "/.state/documents/$account_uid" "$persistent" || fail 'cannot create Persistent link'
+        chown -h "$account_uid:$account_gid" "$persistent" || fail 'cannot set Persistent link owner'
+        restorecon -F -- "$account_home/Persistent" || fail 'cannot label Persistent link'
     fi
+    exec {run_fd}</run
+    open_dir "$run_fd" user-home-setup 0 0 0755; markers_fd=$opened_fd
+    marker="/proc/self/fd/$markers_fd/$account_uid.created"
+    [[ ! -L $marker ]] || fail 'unsafe home creation marker'
+    : >"$marker"
+    chmod 0644 "$marker"
 fi
-printf '%s: %s\n' "$account_name" "$target"
+printf '%s: %s (persistent storage: /.state/documents/%s)\n' "$account_name" "$account_home" "$account_uid"

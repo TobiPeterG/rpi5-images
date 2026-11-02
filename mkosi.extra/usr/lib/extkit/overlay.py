@@ -164,6 +164,29 @@ def copy_selected(source, destination):
         destination.symlink_to(os.readlink(source))
     else:
         shutil.copyfile(source, destination, follow_symlinks=False)
+    _preserve_metadata(source, destination, info, attributes)
+
+
+def copy_parent_directories(config, relative, tree):
+    """Keep live parent ownership/modes."""
+    for parent in reversed(relative.parents):
+        if parent == Path('.'):
+            continue
+        source, destination = config.root / parent, tree / parent
+        if destination.is_symlink() or source.is_symlink():
+            fail(f'symlinked parent directory is unsupported: /{parent}')
+        destination.mkdir(parents=True, exist_ok=True)
+        if not source.is_dir():
+            continue  # Deleted subtrees may have parents absent from the live view.
+        info = source.lstat()
+        attributes = {name: os.getxattr(source, name, follow_symlinks=False)
+                      for name in os.listxattr(source, follow_symlinks=False)
+                      if not name.startswith(('trusted.overlay.', 'user.overlay.'))}
+        _preserve_metadata(source, destination, info, attributes)
+
+
+def _preserve_metadata(source, destination, info, attributes):
+    symlink = stat.S_ISLNK(info.st_mode)
     try:
         if os.geteuid() == 0:
             os.chown(destination, info.st_uid, info.st_gid, follow_symlinks=False)

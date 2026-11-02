@@ -1,5 +1,5 @@
 # Shared by the merge services and interactive shell commands.
-SYSTEMD_SYSEXT_HIERARCHIES=/usr:/opt:/var
+SYSTEMD_SYSEXT_HIERARCHIES=/usr:/opt:/var:/home:/root
 # Require kernel verification using trusted keyrings; ignore sidecar files.
 SYSTEMD_ALLOW_USERSPACE_VERITY=0
 SYSTEMD_DISSECT_VERITY_SIGNATURE=1

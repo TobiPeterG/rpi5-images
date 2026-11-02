@@ -1,0 +1,5 @@
+# Per-user persistent storage
+/\.state/documents    system_u:object_r:home_root_t:s0
+/\.state/documents/[0-9]+    system_u:object_r:user_home_dir_t:s0
+/\.state/documents/[0-9]+/.*    system_u:object_r:user_home_t:s0
+/\.state/documents/0(/.*)?    system_u:object_r:admin_home_t:s0
