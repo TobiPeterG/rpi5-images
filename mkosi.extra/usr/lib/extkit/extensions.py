@@ -11,6 +11,7 @@ from . import diff
 from . import images
 from . import overlay
 from . import quarantine
+from . import selection
 from . import status
 from . import store
 from . import validation
@@ -23,10 +24,12 @@ from .status import mounted_extensions
 
 
 def command_diff(config: ExtkitConfig, args):
+    selectors = selection.parse_selectors(args.paths)
     staged = set(store.staged_paths(config, args.kind))
     show_staged = getattr(args, "staged", False)
     candidates = staged if show_staged else set(overlay.changed_paths(config, args.kind)) - staged
-    paths = overlay.select_paths(args.paths, candidates, "staged" if show_staged else "unstaged")
+    paths = selection.select_paths(selectors, candidates, "staged" if show_staged else "unstaged",
+                                   ignored_patterns=() if show_staged else config.ignored_paths)
     with overlay.base_tree(config) as base:
         for path in paths:
             try:
@@ -36,10 +39,11 @@ def command_diff(config: ExtkitConfig, args):
 
 
 @state_transaction
-def _stage(config: ExtkitConfig, args):
-    paths = overlay.select_paths(args.paths, overlay.changed_paths(config, args.kind), "changed")
+def _stage(config: ExtkitConfig, args, selectors):
+    paths = selection.select_paths(selectors, overlay.changed_paths(config, args.kind), "changed",
+                                   ignored_patterns=config.ignored_paths)
     deletions = set(store.load_deletions(config))
-    selection = set(store.load_selection(config))
+    selected = set(store.load_selection(config))
     staged = 0
     skipped = []
     for path in paths:
@@ -51,26 +55,26 @@ def _stage(config: ExtkitConfig, args):
                 skipped.append((path, exc))
                 continue
             deletions.add(path)
-            selection.discard(path)
+            selected.discard(path)
         else:
-            selection.add(path)
+            selected.add(path)
             deletions.discard(path)
         staged += 1
-    store.save_index(config, selection, deletions)
-    print(f"Staged {staged} path(s). {len(selection) + len(deletions)} total. Content will be read at build time", color="green")
+    store.save_index(config, selected, deletions)
+    print(f"Staged {staged} path(s). {len(selected) + len(deletions)} total. Content will be read at build time", color="green")
     for path, skipped_error in skipped:
         print(f"Skipped {path}: {skipped_error}", file=sys.stderr, color="yellow")
 
 
 @state_transaction
-def _unstage(config: ExtkitConfig, args):
-    selection = set(store.load_selection(config))
+def _unstage(config: ExtkitConfig, args, selectors):
+    selected = set(store.load_selection(config))
     deletions = set(store.load_deletions(config))
-    for path in overlay.select_paths(args.paths, store.staged_paths(config, args.kind), "staged"):
-        selection.discard(path)
+    for path in selection.select_paths(selectors, store.staged_paths(config, args.kind), "staged"):
+        selected.discard(path)
         deletions.discard(path)
-    store.save_index(config, selection, deletions)
-    print(f"{len(selection) + len(deletions)} staged path(s) remain")
+    store.save_index(config, selected, deletions)
+    print(f"{len(selected) + len(deletions)} staged path(s) remain")
 
 
 @state_transaction
@@ -80,17 +84,7 @@ def command_enable(config: ExtkitConfig, args):
             fail("a version cannot be specified when enabling '*'")
         candidates = []
         for kind in (args.kind,) if args.kind else config.kinds:
-            newest: dict[str, tuple[str, Path]] = {}
-            directory = store.store_dir(config, kind)
-            for image in directory.glob("*.raw") if directory.exists() else []:
-                parsed = store.split_image_name(image)
-                if parsed is None:
-                    continue
-                name, version = parsed
-                current = newest.get(name)
-                if current is None or store.version_key(version) > store.version_key(current[0]):
-                    newest[name] = (version, image)
-            for name, (_, image) in sorted(newest.items()):
+            for name, image in store.latest_images(config, kind).items():
                 link = store.enabled_dir(config, kind) / f"{name}.raw"
                 if not link.exists() and not link.is_symlink():
                     candidates.append((kind, name, image))
@@ -109,30 +103,16 @@ def command_enable(config: ExtkitConfig, args):
 
 @state_transaction
 def command_disable(config: ExtkitConfig, args):
-    if args.name == "*":
-        candidates = []
-        for kind in (args.kind,) if args.kind else config.kinds:
-            directory = store.enabled_dir(config, kind)
-            for link in sorted(directory.glob("*.raw")) if directory.exists() else []:
-                if link.is_symlink() and link.resolve().is_relative_to(store.store_dir(config, kind)):
-                    candidates.append((kind, link))
-        if not candidates:
-            fail("no managed enabled extensions found")
-        for kind, link in candidates:
-            link.unlink()
-            print(f"Disabled on next boot: {kind}/{link.stem}", color="green")
-        return
-    validation.checked_name(args.name)
-    candidates = []
-    for kind in (args.kind,) if args.kind else config.kinds:
-        link = store.enabled_dir(config, kind) / f"{args.name}.raw"
-        if link.is_symlink() and link.resolve().is_relative_to(store.store_dir(config, kind)):
-            candidates.append((kind, link))
+    all_names = args.name == "*"
+    if not all_names:
+        validation.checked_name(args.name)
+    candidates = [(kind, link) for kind in ((args.kind,) if args.kind else config.kinds)
+                  for link in store.managed_enabled_links(config, kind, None if all_names else args.name)]
     if not candidates:
-        fail(f"no managed enabled images for {args.name}")
+        fail("no managed enabled extensions found" if all_names else f"no managed enabled images for {args.name}")
     for kind, link in candidates:
         link.unlink()
-        print(f"Disabled on next boot: {kind}/{args.name}", color="green")
+        print(f"Disabled on next boot: {kind}/{link.stem}", color="green")
 
 
 def command_inspect(config: ExtkitConfig, args):
@@ -170,14 +150,17 @@ def command_compare(config: ExtkitConfig, args):
 
 def command_status(config: ExtkitConfig, args):
     index = store.load_index(config)
-    selection, deletions = set(index['selected']), set(index['deleted'])
+    selected, deletions = set(index['selected']), set(index['deleted'])
     changed = set(overlay.changed_paths(config, args.kind))
-    staged = sorted(path for path in selection | deletions if args.kind is None or overlay.kind_for(config, overlay.relative_path(config, path)) == args.kind)
+    if not getattr(args, "all", False):
+        changed = {path for path in changed
+                   if not selection.ignored_path(config, Path(path).relative_to("/"))}
+    staged = sorted(path for path in selected | deletions if args.kind is None or overlay.kind_for(config, overlay.relative_path(config, path)) == args.kind)
     print("Staged:")
     for path in staged:
         print(f"  {path}" + (" (deleted)" if path in deletions else ""))
     print("Unstaged:")
-    for path in sorted(changed - selection - deletions):
+    for path in sorted(changed - selected - deletions):
         print(f"  {path}")
     print("Extensions:")
     quarantine.print_quarantine(config, args.kind)
@@ -235,10 +218,8 @@ def describe_entry(path, relative):
 
 
 def command_stage(config: ExtkitConfig, args):
-    args.paths = overlay.normalize_shell_glob(args.paths)
-    return _stage(config, args)
+    return _stage(config, args, selection.parse_selectors(args.paths))
 
 
 def command_unstage(config: ExtkitConfig, args):
-    args.paths = overlay.normalize_shell_glob(args.paths)
-    return _unstage(config, args)
+    return _unstage(config, args, selection.parse_selectors(args.paths))

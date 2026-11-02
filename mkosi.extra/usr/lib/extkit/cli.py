@@ -14,7 +14,7 @@ from . import build as build_workflow
 from . import config as configuration
 from . import extensions
 from . import metadata
-from . import overlay
+from . import selection
 from . import signing
 from .console import print
 from .errors import ExtkitError
@@ -49,6 +49,8 @@ def main(argv=None):
         elif command == "policy":
             p.add_argument("name")
             p.add_argument("updates", choices=metadata.UPDATE_POLICIES)
+        if command == "status":
+            p.add_argument("--all", action="store_true", help="also show ignored unstaged changes")
         if command == "diff":
             p.add_argument("--staged", action="store_true")
             p.add_argument("--content", action="store_true", help="stream complete base/live bytes as hexadecimal.")
@@ -93,7 +95,7 @@ def main(argv=None):
         args.command = "status"
         args.kind = None
     if args.command in ("enable", "disable"):
-        targets = overlay.normalize_shell_glob(args.targets)
+        targets = selection.normalize_shell_glob(args.targets)
         if targets == ["*"]:
             args.name, args.version = "*", None
         elif args.command == "enable" and len(targets) in (1, 2):

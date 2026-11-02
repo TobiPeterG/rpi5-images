@@ -110,18 +110,39 @@ def runtime_dir(config: ExtkitConfig, kind):
     return config.runtime_dirs[kind]
 
 
-def image_versions(config: ExtkitConfig, kind, name):
-    versions = {}
+def version_number(value):
+    text = str(value)
+    if not text.isdecimal() or int(text) < 1:
+        fail(f'extension versions must be positive integers: {value}')
+    return int(text)
+
+
+def image_inventory(config: ExtkitConfig, kind, name=None):
+    """Validated inventory"""
+    inventory = {}
     directory = store_dir(config, kind)
-    for image in directory.glob(f"{name}_*.raw") if directory.exists() else []:
+    pattern = f'{name}_*.raw' if name is not None else '*.raw'
+    for image in sorted(directory.glob(pattern)) if directory.exists() else []:
         parsed = split_image_name(image)
-        if parsed is None or parsed[0] != name:
+        if parsed is None or (name is not None and parsed[0] != name) or not image.is_file():
             continue
-        version = parsed[1]
-        if not version.isdecimal() or int(version) < 1:
-            fail(f"automatic versioning requires positive integer versions: {image}")
-        versions[int(version)] = image
-    return versions
+        image_name, version = parsed
+        validation.checked_name(image_name)
+        number = version_number(version)
+        versions = inventory.setdefault(image_name, {})
+        if number in versions:
+            fail(f'ambiguous extension version {image_name} {number}: {versions[number]} and {image}')
+        versions[number] = image
+    return inventory
+
+
+def image_versions(config: ExtkitConfig, kind, name):
+    return image_inventory(config, kind, name).get(name, {})
+
+
+def latest_images(config: ExtkitConfig, kind):
+    return {name: versions[max(versions)]
+            for name, versions in image_inventory(config, kind).items()}
 
 
 def latest_image(config: ExtkitConfig, kind, name):
@@ -131,13 +152,12 @@ def latest_image(config: ExtkitConfig, kind, name):
 
 def requested_images(config: ExtkitConfig, name, version=None, kind=None):
     validation.checked_name(name)
-    if version is not None:
-        validation.checked_name(version)
+    number = version_number(version) if version is not None else None
     found = []
     for candidate_kind in (kind,) if kind else config.kinds:
-        image = (store_dir(config, candidate_kind) / f"{name}_{version}.raw"
-                 if version is not None else latest_image(config, candidate_kind, name))
-        if image is not None and image.is_file():
+        versions = image_versions(config, candidate_kind, name)
+        image = versions.get(number) if number is not None else (versions[max(versions)] if versions else None)
+        if image is not None:
             found.append((candidate_kind, image))
     if not found:
         suffix = f" version {version}" if version is not None else ""
@@ -147,15 +167,11 @@ def requested_images(config: ExtkitConfig, name, version=None, kind=None):
 
 def stored_extension_states(config: ExtkitConfig, kind):
     states = []
-    directory = store_dir(config, kind)
-    for image in sorted(directory.glob("*.raw")) if directory.exists() else []:
-        parsed = split_image_name(image)
-        if parsed is None:
-            continue
-        name, _ = parsed
+    for name, versions in image_inventory(config, kind).items():
         link = enabled_dir(config, kind) / f"{name}.raw"
-        selected = link.is_symlink() and link.resolve() == image.resolve()
-        states.append((image, selected, link if selected else None))
+        for _, image in sorted(versions.items()):
+            selected = link.is_symlink() and link.resolve() == image.resolve()
+            states.append((image, selected, link if selected else None))
     return states
 
 
@@ -171,9 +187,11 @@ def split_image_name(image):
     return stem.split("_", 1)
 
 
-def version_key(value):
-    return tuple((0, int(part)) if part.isdigit() else (1, part.casefold())
-                 for part in re.split(r"([0-9]+)", value))
+def managed_enabled_links(config: ExtkitConfig, kind, name=None):
+    directory = enabled_dir(config, kind)
+    pattern = f'{name}.raw' if name is not None else '*.raw'
+    return [link for link in sorted(directory.glob(pattern)) if link.is_symlink()
+            and link.resolve().is_relative_to(store_dir(config, kind))]
 
 
 def enable_image(config: ExtkitConfig, kind, name, image):

@@ -9,6 +9,7 @@ from types import MappingProxyType
 from typing import Mapping, NoReturn
 
 from .errors import ConfigurationError
+from .selection import parse_pattern
 
 
 def fail(message) -> NoReturn:
@@ -56,6 +57,7 @@ class ExtkitConfig:
     addon_settings: AddonConfig
     kinds: Mapping[str, tuple[str, ...]]
     excluded_trees: tuple[tuple[str, ...], ...]
+    ignored_paths: tuple[tuple[str, ...], ...]
 
     def __post_init__(self):
         for name in ('enabled_dirs', 'runtime_dirs', 'kinds'):
@@ -135,6 +137,12 @@ def _load_config(path):
         relative = path_value.relative_to("/")
         excluded.append(relative.parts)
     excluded_trees = tuple(excluded)
+    ignored_paths = []
+    for value in extensions.get("IgnoredPaths", "").splitlines():
+        value = value.strip()
+        if not value:
+            continue
+        ignored_paths.append(parse_pattern(value))
     erofs_tool = config["Build"]["ErofsTool"]
     erofs_fsck_tool = config["Build"].get("ErofsFsckTool", "fsck.erofs")
     phone_configuration = Path(config.get('Phone', 'Configuration', fallback='/etc/extkit-phone.conf'))
@@ -167,7 +175,7 @@ def _load_config(path):
         erofs_tool=erofs_tool, erofs_fsck_tool=erofs_fsck_tool,
         phone_configuration=phone_configuration, repart_tool=repart_tool,
         boot_settings=boot_settings, addon_settings=addon_settings,
-        kinds=kinds, excluded_trees=excluded_trees,
+        kinds=kinds, excluded_trees=excluded_trees, ignored_paths=tuple(ignored_paths),
     )
 
 
