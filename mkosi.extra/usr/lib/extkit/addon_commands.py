@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import addons
 from . import addon_state
+from . import addon_inventory
 from . import filesystem
 from . import phone_client
 from . import signing
@@ -18,22 +19,6 @@ from .console import print
 from .errors import PublicationError, fail
 from .models import ArtifactResult, Activation
 from .trust import enrolled_certificates
-
-
-def addon_versions(config: ExtkitConfig, name):
-    validation.checked_name(name)
-    directory = config.state / "store/addon"
-    pattern = re.compile(re.escape(name) + r"_([1-9][0-9]*)\.addon\.efi\Z")
-    return {int(match[1]): path for path in directory.glob(f"{name}_*.addon.efi")
-            if (match := pattern.fullmatch(path.name))}
-
-
-def selected_addon(config: ExtkitConfig, args):
-    versions = addon_versions(config, args.name)
-    version = int(args.version) if getattr(args, "version", None) else max(versions, default=0)
-    if version not in versions:
-        fail("addon version not found")
-    return versions[version]
 
 
 def addon_boot_directory(config: ExtkitConfig):
@@ -53,7 +38,7 @@ def addon_certificates(config: ExtkitConfig):
 def sign_addon(config: ExtkitConfig, image, enable=True):
     """Per-artifact signing plus short, conditional per-name activation."""
     with filesystem.artifact_locks(config, [image]):
-        name, version = image.name.removesuffix('.addon.efi').rsplit('_', 1)
+        name, version = addon_inventory.parse_filename(image)
         destination = addon_boot_directory(config) if enable else None
         expected = addon_state.capture(config, name, destination) if destination is not None else None
 
@@ -121,7 +106,7 @@ def build_addon(config: ExtkitConfig, args):
         architecture = {'aarch64': 'arm64', 'x86_64': 'x86-64'}.get(os.uname().machine)
     data = addons.build(command_line, architecture)
     with filesystem.locked_state(config.state):
-        version = max(addon_versions(config, args.name), default=0) + 1
+        version = max(addon_inventory.versions(config, args.name), default=0) + 1
         directory = config.state / 'store/addon'
         directory.mkdir(parents=True, exist_ok=True)
         image = directory / f'{args.name}_{version}.addon.efi'
@@ -138,11 +123,11 @@ def build_addon(config: ExtkitConfig, args):
 
 def sign_selected_addon(config: ExtkitConfig, args):
     signing.warn_if_signing_key_unenrolled(config)
-    sign_addon(config, selected_addon(config, args), enable=not args.no_enable)
+    sign_addon(config, addon_inventory.selected(config, args.name, getattr(args, 'version', None)), enable=not args.no_enable)
 
 
 def enable_addon(config: ExtkitConfig, args):
-    image = selected_addon(config, args)
+    image = addon_inventory.selected(config, args.name, getattr(args, 'version', None))
     with filesystem.artifact_locks(config, [image]):
         directory = addon_boot_directory(config)
         addon_state.apply(config, args.name, directory,
@@ -163,7 +148,7 @@ def disable_addon(config: ExtkitConfig, args):
 
 
 def inspect_addon(config: ExtkitConfig, args):
-    image = selected_addon(config, args)
+    image = addon_inventory.selected(config, args.name, getattr(args, 'version', None))
     command_line, architecture, signed = addons.inspect(image.read_bytes())
     print(f"{image.name}: {architecture}. Signature: {'signed' if signed else 'unsigned'}\n{command_line}")
 
@@ -176,17 +161,19 @@ def command_addon(config: ExtkitConfig, args):
 
 
 def print_addon_status(config: ExtkitConfig, indent=""):
-    images = sorted((config.state / "store/addon").glob("*.addon.efi"))
-    if not images:
+    entries = addon_inventory.inventory(config)
+    if not entries:
         print(f"{indent}none")
         return
     certificates = addon_certificates(config)
-    for image in images:
+    for entry in entries:
+        image = entry.path
         try:
+            if entry.error:
+                fail(entry.error)
             command_line, architecture, signed = addons.inspect(image.read_bytes())
             trusted = addons.verify(image, certificates) if signed else False
-            name = image.name.removesuffix(".addon.efi").rsplit("_", 1)[0]
-            active = config.addon_settings.boot_directory / "loader/addons" / f"{name}.addon.efi"
+            active = config.addon_settings.boot_directory / "loader/addons" / f"{entry.name}.addon.efi"
             enabled = active.is_file() and active.read_bytes() == image.read_bytes()
             print(f"{indent}{image.name}: {architecture}. Signature: {'signed' if signed else 'unsigned'}. "
                   f"trust: {'trusted' if trusted else 'not trusted'}. "

@@ -1,7 +1,6 @@
 """Boot install operations."""
 
 import fcntl
-import hashlib
 import os
 import re
 import shutil
@@ -39,8 +38,7 @@ def make_boot_update_space(image, signature, directory, versioned):
             fail(f"boot destination must be a regular file: {path}")
     active_digest = None
     if active[0].exists():
-        with active[0].open("rb") as stream:
-            active_digest = hashlib.file_digest(stream, "sha256").hexdigest()[:12]
+        active_digest = filesystem.file_sha256(active[0])[:12]
     sources = {image.resolve(), signature.resolve()}
     pairs = boot_recovery_pairs(directory)
     matching_active = [path for path in pairs
@@ -73,8 +71,7 @@ def install_boot_files(pair: VerifiedBootPair, directory: Path, version: str | N
     image, signature = pair.image, pair.signature
     if filesystem.file_sha256(image) != pair.image_sha256 or filesystem.file_sha256(signature) != pair.signature_sha256:
         raise InstallationError('verified boot pair changed before installation')
-    with image.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    digest = filesystem.file_sha256(image)
     lines = signature.read_text("ascii").splitlines()
     if not lines or lines[0].lower() != digest:
         fail("returned boot.sig does not match the downloaded boot.img")

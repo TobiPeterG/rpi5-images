@@ -12,3 +12,10 @@ def checked_name(value):
     if not NAME_RE.fullmatch(value) or value in (".", ".."):
         fail(f"invalid name/version: {value!r}")
     return value
+
+
+def positive_version(value):
+    text = str(value)
+    if not text.isdecimal() or int(text) < 1:
+        fail(f'versions must be positive integers: {value}')
+    return int(text)

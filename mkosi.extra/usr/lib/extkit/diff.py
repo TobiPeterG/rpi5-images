@@ -1,14 +1,13 @@
 """Structured filesystem comparison."""
 
 import difflib
-import hashlib
 import os
 import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import overlay
+from . import filesystem, overlay
 from .config import ExtkitConfig
 from .console import print
 
@@ -43,22 +42,10 @@ def snapshot(path):
         info = path.lstat()
     except FileNotFoundError:
         return None
-    if stat.S_ISLNK(info.st_mode):
-        kind = 'link'
-    elif stat.S_ISREG(info.st_mode):
-        kind = 'file'
-    elif stat.S_ISDIR(info.st_mode):
-        kind = 'directory'
-    elif stat.S_ISCHR(info.st_mode) and info.st_rdev == 0:
-        kind = 'whiteout'
-    else:
-        kind = 'special'
+    kind = filesystem.file_kind(info)
     attrs = tuple(sorted((name, os.getxattr(path, name, follow_symlinks=False))
                          for name in os.listxattr(path, follow_symlinks=False)))
-    digest = None
-    if kind == 'file':
-        with path.open('rb') as stream:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+    digest = filesystem.file_sha256(path) if kind == 'file' else None
     return FileSnapshot(kind, stat.S_IMODE(info.st_mode), info.st_uid, info.st_gid,
                         os.readlink(path) if kind == 'link' else None, attrs,
                         info.st_size if kind == 'file' else 0, digest)

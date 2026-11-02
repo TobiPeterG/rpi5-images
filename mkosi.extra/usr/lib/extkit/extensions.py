@@ -19,7 +19,7 @@ from .config import ExtkitConfig
 from .console import print
 from .diff import image_entries
 from .errors import fail
-from .filesystem import state_transaction
+from .filesystem import file_kind, state_transaction
 from .status import mounted_extensions
 
 
@@ -206,13 +206,14 @@ def command_list(config: ExtkitConfig, args):
 def describe_entry(path, relative):
     info = path.lstat()
     mode = stat.filemode(info.st_mode)
-    if path.is_symlink():
+    kind = file_kind(info)
+    if kind == "link":
         return f"l {mode} /{relative} -> {os.readlink(path)}"
-    if stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(0, 0):
+    if kind == "whiteout":
         return f"w {mode} /{relative} (deletion whiteout)"
-    if path.is_dir():
+    if kind == "directory":
         return f"d {mode} /{relative}"
-    if path.is_file():
+    if kind == "file":
         return f"f {mode} {info.st_size:>9} /{relative}"
     return f"? {mode} /{relative}"
 

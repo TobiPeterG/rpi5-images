@@ -110,13 +110,6 @@ def runtime_dir(config: ExtkitConfig, kind):
     return config.runtime_dirs[kind]
 
 
-def version_number(value):
-    text = str(value)
-    if not text.isdecimal() or int(text) < 1:
-        fail(f'extension versions must be positive integers: {value}')
-    return int(text)
-
-
 def image_inventory(config: ExtkitConfig, kind, name=None):
     """Validated inventory"""
     inventory = {}
@@ -128,7 +121,7 @@ def image_inventory(config: ExtkitConfig, kind, name=None):
             continue
         image_name, version = parsed
         validation.checked_name(image_name)
-        number = version_number(version)
+        number = validation.positive_version(version)
         versions = inventory.setdefault(image_name, {})
         if number in versions:
             fail(f'ambiguous extension version {image_name} {number}: {versions[number]} and {image}')
@@ -152,7 +145,7 @@ def latest_image(config: ExtkitConfig, kind, name):
 
 def requested_images(config: ExtkitConfig, name, version=None, kind=None):
     validation.checked_name(name)
-    number = version_number(version) if version is not None else None
+    number = validation.positive_version(version) if version is not None else None
     found = []
     for candidate_kind in (kind,) if kind else config.kinds:
         versions = image_versions(config, candidate_kind, name)

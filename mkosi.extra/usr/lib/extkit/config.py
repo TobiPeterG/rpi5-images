@@ -8,6 +8,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, NoReturn
 
+from . import hierarchies
 from .errors import ConfigurationError
 from .selection import parse_pattern
 
@@ -100,32 +101,10 @@ def _load_config(path):
         "confext": Path(paths.get("RuntimeConfextDirectory", "/run/confexts")),
     }
     extensions = config["Extensions"]
-    kinds = {}
-    assigned_prefixes = set()
-    for line in extensions.get("Kinds", "").splitlines():
-        if not line.strip():
-            continue
-        fields = line.split()
-        if len(fields) < 2:
-            fail(f"expected 'TYPE PATH [PATH...]' in Kinds: {line!r}")
-        kind, *prefix_values = fields
-        if kind not in enabled_dirs:
-            fail(f"unsupported extension type in Kinds: {kind!r}")
-        if kind in kinds:
-            fail(f"duplicate extension type in Kinds: {kind!r}")
-        prefixes = []
-        for value in prefix_values:
-            prefix = Path(value)
-            if not prefix.is_absolute() or ".." in prefix.parts or len(prefix.parts) != 2:
-                fail(f"kind paths must be absolute top-level paths: {value!r}")
-            name = prefix.parts[1]
-            if name in assigned_prefixes:
-                fail(f"kind path is assigned more than once: {value!r}")
-            assigned_prefixes.add(name)
-            prefixes.append(name)
-        kinds[kind] = tuple(prefixes)
-    if not kinds:
-        fail("configure at least one Kinds entry")
+    environment_file = Path(extensions["EnvironmentFile"])
+    if not environment_file.is_absolute():
+        environment_file = Path(path).parent / environment_file
+    kinds = hierarchies.load(environment_file)
     excluded = []
     for value in extensions.get("ExcludedTrees", "").splitlines():
         value = value.strip()

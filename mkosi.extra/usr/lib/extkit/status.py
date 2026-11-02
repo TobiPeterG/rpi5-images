@@ -1,13 +1,12 @@
 """Read-only extension status collection."""
 
 import json
-import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import metadata, process, store, verification
+from . import hierarchies, metadata, process, store, verification
 from .config import ExtkitConfig
 from .models import SignatureStatus
 
@@ -48,10 +47,7 @@ def collect(config: ExtkitConfig, kind, *, mounted=None, include_policy=True):
 
 
 def mounted_extensions(config: ExtkitConfig, kind):
-    environment = os.environ.copy()
-    environment[f"SYSTEMD_{kind.upper()}_HIERARCHIES"] = ":".join(
-        f"/{prefix}" for prefix in config.kinds[kind]
-    )
+    environment = hierarchies.environment(config)
     try:
         result = process.run(
             [f"systemd-{kind}", "status", "--json=short", "--no-pager"],

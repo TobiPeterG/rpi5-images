@@ -8,6 +8,7 @@ from pathlib import Path
 
 from . import activation
 from . import images
+from . import hierarchies
 from . import process
 from . import quarantine
 from . import verification
@@ -49,10 +50,7 @@ def command_boot_check(config: ExtkitConfig, args):
 def boot_check_locked(config: ExtkitConfig, args):
     """Boot prerequisite: no directory images, kernel-authenticated DDIs."""
     loader = "systemd-sysext" if args.kind == "sysext" else "systemd-confext"
-    environment = verification_environment()
-    if args.kind == "sysext":
-        environment["SYSTEMD_SYSEXT_HIERARCHIES"] = ":".join(
-            "/" + hierarchy for hierarchy in config.kinds["sysext"])
+    environment = verification_environment(hierarchies.environment(config))
     # Discovery collapses duplicate names. Inspect every search directory as
     # well, so a shadowed directory cannot escape the boot prerequisite.
     for kind, directories in quarantine.extension_search_directories(config).items():

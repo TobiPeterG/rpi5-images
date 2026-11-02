@@ -10,6 +10,7 @@ from pathlib import Path
 from . import process, selection
 from .config import ExtkitConfig
 from .errors import fail
+from .filesystem import file_kind
 
 
 def relative_path(config: ExtkitConfig, value, kind=None):
@@ -63,7 +64,7 @@ def is_whiteout(config: ExtkitConfig, relative):
             info = candidate.lstat()
         except FileNotFoundError:
             continue
-        if stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(0, 0):
+        if file_kind(info) == "whiteout":
             return True
         if stat.S_ISREG(info.st_mode) and info.st_size == 0:
             try:

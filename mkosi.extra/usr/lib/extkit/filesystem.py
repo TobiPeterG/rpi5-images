@@ -4,6 +4,7 @@ import fcntl
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -34,6 +35,19 @@ def locked_state(directory):
             yield
         finally:
             held.remove(key)
+
+
+def file_kind(info):
+    """Classify an lstat result."""
+    if stat.S_ISLNK(info.st_mode):
+        return 'link'
+    if stat.S_ISREG(info.st_mode):
+        return 'file'
+    if stat.S_ISDIR(info.st_mode):
+        return 'directory'
+    if stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(0, 0):
+        return 'whiteout'
+    return 'special'
 
 
 def file_sha256(path):
