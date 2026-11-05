@@ -1,0 +1,9 @@
+#!/usr/bin/bash -p
+# fix template link
+set -euo pipefail
+source /usr/libexec/user-documents-common
+load_account "${SUBJECT:?missing useradd account}" || exit 1
+has_documents_home || exit 0
+[[ -L $account_home/Persistent ]] || exit 0
+[[ $(readlink -- "$account_home/Persistent") == '/.state/documents/@UID@' ]] || exit 0
+/usr/bin/bash -p /usr/libexec/user-documents-setup "$account_uid"
